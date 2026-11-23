@@ -1,3 +1,5 @@
 * text=auto
 *.ico binary
 *.png binary
+decision_models/*.txt -text
+decision_models/*.md -text
