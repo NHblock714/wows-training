@@ -111,7 +111,10 @@ class MainWindow(QMainWindow):
         initialize_client_preferences(self)
         from .update_controls import UpdateController
         self.updates = UpdateController(self)
+        self._update_dialog = None
+        self._notified_versions = set()
         self.updates.idle.connect(self._check_close)
+        self.updates.update_available.connect(self._show_update_notice)
         self.updates.changed.connect(self._show_downloaded_update)
         from .combo_effects import install_combo_effects
         self.combo_effects = install_combo_effects(self)
@@ -121,7 +124,18 @@ class MainWindow(QMainWindow):
 
     def start_update_check(self):
         if not self._closing and self.client_preferences['check_updates']:
-            self.updates.check(self.client_preferences['download_updates'])
+            self.updates.check(self.client_preferences['download_updates'], notify=True)
+
+    def _show_update_notice(self, installer):
+        if self._closing or not self.isVisible() or installer.version in self._notified_versions:
+            return
+        if self._update_dialog is not None:
+            self._update_dialog.reject()
+        from .update_controls import UpdateDialog
+        dialog = self._update_dialog = UpdateDialog(self, installer)
+        self._notified_versions.add(installer.version)
+        dialog.finished.connect(lambda _result: setattr(self, '_update_dialog', None))
+        dialog.show()
 
     def _show_downloaded_update(self):
         if self.updates.downloaded_path and self.updates.message.endswith("已下载并校验。"):
