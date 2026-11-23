@@ -1,0 +1,9 @@
+{
+  "version": "wows-tactical-brief-9",
+  "max_findings": 3,
+  "max_actions": 3,
+  "max_interpretations": 2,
+  "max_item_characters": 110,
+  "max_conclusion_characters": 90,
+  "max_brief_characters": 1400
+}

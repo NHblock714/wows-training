@@ -1,0 +1,5 @@
+World-of-Warships-replays-parser 3.4.2
+Author: Oleksandr Shyshatskyi
+Installed package metadata: License: MIT
+Source: https://github.com/Monstrofil/replays_unpack/tree/eb70d7087d68c6e71d97854feacadefd36bd8a35
+The pinned upstream tree and wheel do not contain a separate license text.

@@ -1,0 +1,11 @@
+# Pin the upstream commit: the PyPI wheel with the same version lacks these schemas.
+World-of-Warships-replays-parser @ git+https://github.com/Monstrofil/replays_unpack.git@eb70d7087d68c6e71d97854feacadefd36bd8a35
+pycryptodomex==3.23.0
+lxml==6.1.0
+packaging==26.2
+xdis==6.3.0
+click==8.5.0
+six==1.17.0
+capstone==5.0.9
+pefile==2024.8.26
+

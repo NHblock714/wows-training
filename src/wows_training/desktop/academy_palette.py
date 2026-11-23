@@ -1,0 +1,12 @@
+"""Shared colours for the desktop shell, instruments and interaction feedback."""
+CANVAS = '#EDF4FA'
+PAPER = '#FFFFFF'
+INK = '#12263D'
+MUTED = '#486078'
+BLUE = '#1263D3'
+CYAN = '#44DBF3'
+PINK = '#F057A6'
+NIGHT = '#111D31'
+PANEL = '#1A2C45'
+LINE = '#BDCDDE'
+ICE = '#DCEBFA'

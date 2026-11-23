@@ -1,0 +1,6 @@
+interface:
+  display_name: "战舰世界打法复盘"
+  short_description: "结合舰名分镜、实装配件、持续伤害与结算评价单局发挥和关键取舍"
+  default_prompt: "使用 $wows-tactical-brief，结合所选比赛的录像与图组评价打法，指出关键取舍和下一局可执行的调整。"
+policy:
+  allow_implicit_invocation: true

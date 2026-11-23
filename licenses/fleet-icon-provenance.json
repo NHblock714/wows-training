@@ -1,0 +1,26 @@
+{
+  "format_version": 2,
+  "source": "User-drawn texture.png",
+  "source_sha256": "2d3dd3fc208d85c66d3964841b8a2377b52ad7b18035d38bda9f59d1d65400f8",
+  "source_file": "fleet-texture.png",
+  "source_size": [
+    32,
+    32
+  ],
+  "alpha_values": [
+    0,
+    255
+  ],
+  "rgba_colours": 26,
+  "master": "original PNG bytes embedded verbatim; all pixel colours and positions retained",
+  "sizes": {
+    "16": "nearest-neighbour downsample",
+    "24": "nearest-neighbour downsample",
+    "32": "exact original PNG",
+    "48": "original 32px centered at (8,8) on transparent 48px canvas",
+    "64": "2x integer enlargement",
+    "128": "4x integer enlargement",
+    "256": "8x integer enlargement"
+  },
+  "sidebar": "integer physical-pixel scaling, aligned to the actual paint-device grid; no frame or background"
+}
