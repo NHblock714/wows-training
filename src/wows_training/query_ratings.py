@@ -65,27 +65,22 @@ def _known_scores(scores, rows):
 def player_ratings(career, profile, *, species=None, tier=None, achievements=None):
     raw, fleet, refs = _inputs(career, profile)
     result = dict(scores={}, strengths=[], weaknesses=[], styles=[], challenges=[], overall=None, power=None,
-                  modifiers={}, all_challenges_count=len(challenges.CHALLENGES), challenge_complete_data=False)
+                  modifiers={}, all_challenges_count=len(challenges.CHALLENGES))
+    if achievements is None:
+        achievements = (profile or {}).get('achievements')
+    gallery, collections = challenges.evaluate_challenges(raw, fleet, achievements,
+        encyclopedia=refs.get('encyclopedia'), local_catalog=refs.get('local_catalog'))
+    completed = challenges.get_completed_challenges(gallery)
+    result.update(achievement_gallery=gallery, ship_collections=collections, challenges=completed,
+                  challenge_complete_data=all(row['complete'] for row in gallery))
     stats = PlayerStats.from_mode_dict(raw)
     if stats is None:
         return result
     frame = _frame(fleet, refs)
     benchmarks = refs.get('benchmarks') or {}
-    stats.achievements = achievements or {}
     full_scores = _known_scores(analysis.compute_scores(stats, benchmarks, frame), [raw])
     if full_scores and all(k in full_scores for k in _AXIS_FIELDS):
         result['styles'] = battle_style.infer_battle_style(full_scores, stats, frame)
-    eligible = frame
-    # The low-average-damage challenge must never interpret an absent damage total as zero.
-    with_damage = {str(r['ship_id']) for r in fleet.get('ships') or [] if _has(r.get('statistics'), 'damage_dealt')}
-    if not frame.empty:
-        eligible = frame[frame['ship_id'].astype(str).isin(with_damage)]
-    completed = challenges.get_completed_challenges(stats, eligible)
-    result['challenges'] = completed
-    result['challenge_complete_data'] = bool(achievements is not None and fleet.get('status') == 'ok' and
-        all(_has(raw, k) for k in ('max_frags_battle', 'max_total_agro', 'max_planes_killed',
-            'max_ships_spotted', 'max_xp', 'max_damage_dealt', 'max_damage_scouting', 'draws',
-            'ramming.frags', 'planes_killed')) and len(eligible) == len(frame))
     pr = profile.get('rating') or {}
     if pr.get('battle_power') is not None and not frame.empty:
         mods = personal_rating.compute_battle_power_modifiers(stats, frame, len(completed))

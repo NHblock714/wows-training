@@ -8,13 +8,15 @@ Windows 上的《World of Warships》录像复盘与战绩查询工具。导入 
 
 客户端默认在联网启动时检查 GitHub 正式发行版。发现新版会弹窗提示，并按设置下载和校验安装包。每次启动中同一版本只提示一次，离线检查失败时可在「客户端设置 → 版本更新」查看状态。安装包下载完成后可打开下载目录，自行启动安装。
 
+源码版本的改动见 [更新说明](CHANGELOG.md)。
+
 ## 分析报告
 
 单局报告结合连续小地图、敌我阵容、实装配件、起火进水、承伤和结算数据。位置优先使用录像时点、A–J／1–10 地图格和占点相对方位，例如「D6，B 点西侧」。已有录像可以重新预览并生成报告。
 
 ## 从源代码构建
 
-在 Windows 上使用 Python 3.13，安装 `requirements-desktop.txt` 中的依赖。克隆仓库后，从 Releases 下载同版本的 `win64-distribution.zip`。用发布页给出的归档 SHA-256 还原运行资源，再启动源码或使用 PyInstaller 打包。
+在 Windows 上使用 Python 3.13，安装 `requirements-desktop.txt` 中的依赖。v0.34.2 源码使用 v0.34.1 的 `win64-distribution.zip` 还原运行资源。用发布页给出的归档 SHA-256 校验，再启动源码或使用 PyInstaller 打包。
 
 ```powershell
 py -3.13 -m venv .venv

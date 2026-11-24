@@ -1,5 +1,5 @@
 """An account-free projection of one pinned public career snapshot for AI."""
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date
 from functools import lru_cache
 import math
@@ -25,6 +25,8 @@ PROFILE_KINDS = {
     "career_mode_summaries": ("P08", "各模式表现"),
     "career_mode_fleets": ("P09", "各模式船仓"),
     "career_server_comparison": ("P10", "同服同舰基准"),
+    "career_combat_style": ("P11", "战斗表现细项"),
+    "career_class_performance": ("P12", "按舰种表现"),
 }
 REGION_NAMES = {"asia": "亚服", "eu": "欧服", "na": "北美服"}
 CLASS_NAMES = {"AUX": "辅助舰", "BB": "战列舰", "CA": "巡洋舰", "CV": "航空母舰", "DD": "驱逐舰",
@@ -64,6 +66,18 @@ for weapon, weapon_label in _WEAPONS.items():
 METRIC_LABELS.update({f"wins_by_tasks_{n}": f"达成 {n} 项任务的行动胜场" for n in range(6)})
 BATTLE_COUNTS.update(f"wins_by_tasks_{n}" for n in range(6))
 _RANDOM_DIVISION_MODES = frozenset({"pvp_solo", "pvp_div2", "pvp_div3"})
+_SUPPORT_TOTALS = {
+    "avg_scouting_damage": ("damage_scouting",),
+    "avg_ships_spotted": ("ships_spotted",),
+    "avg_potential_damage": ("art_agro", "torpedo_agro"),
+    "avg_capture_points": ("capture_points",),
+    "avg_dropped_capture_points": ("dropped_capture_points",),
+}
+_HIT_RATE_FIELDS = {"main_battery": "main_battery_hit_rate", "second_battery": "second_battery_hit_rate",
+                    "torpedoes": "torpedo_hit_rate", "aircraft": "aircraft_hit_rate"}
+_STYLE_LABELS = {**METRIC_LABELS, "second_battery_hit_rate": "副炮命中率",
+                 "aircraft_hit_rate": "舰载机命中率", "avg_damage_received": "场均实际承伤",
+                 "damage_received_to_dealt_ratio": "实际承伤／造伤比"}
 
 
 def _mapping(value):
@@ -107,8 +121,12 @@ def _metrics_text(rows):
 
 @lru_cache(maxsize=1)
 def _verified_ship_catalog():
+    from .career_catalog import current_ship_catalog
     from .runtime_bundle import load_bundle
-    return load_bundle(verify=False).ship_catalog()
+    catalog = load_bundle(verify=False).ship_catalog()
+    for ship, update in current_ship_catalog().items():
+        catalog[ship] = {**catalog.get(ship, {}), **{key: value for key, value in update.items() if value is not None}}
+    return catalog
 
 
 def _scope(region, raw):
@@ -213,9 +231,72 @@ def _tracked_battles(stats, field):
 
 def _scoped_metrics(stats):
     values = metrics(stats)
-    if "battles_since_510" in stats:
-        values["avg_scouting_damage"] = ratio(stats.get("damage_scouting"), _tracked_battles(stats, "battles_since_510"))
+    for field, totals in _SUPPORT_TOTALS.items():
+        amounts = [stats.get(key) for key in totals]
+        values[field] = ratio(sum(amounts), _tracked_battles(stats, "battles_since_510")) if all(
+            _finite(amount) for amount in amounts) else None
     return values
+
+
+def _style_counts(stats):
+    """Yield paired counters so aggregation uses matching samples for each metric."""
+    battles = _battles(stats.get("battles"))
+    if not battles:
+        return
+    for field, key, unit, bounded in (("avg_damage", "damage_dealt", "场均", False),
+                                      ("survival_rate", "survived_battles", "比例", True),
+                                      ("avg_frags", "frags", "场均", False)):
+        total = _battles(stats.get(key)) if bounded else stats.get(key)
+        if _finite(total) and (not bounded or total <= battles):
+            yield field, total, battles, battles, unit, "同模式累计场次"
+    tracked = _tracked_battles(stats, "battles_since_510")
+    if tracked:
+        for field, keys in _SUPPORT_TOTALS.items():
+            amounts = [stats.get(key) for key in keys]
+            if all(_finite(amount) for amount in amounts):
+                yield field, sum(amounts), tracked, tracked, "场均", "该模式 0.5.10 起可统计场次"
+    for weapon, field in _HIT_RATE_FIELDS.items():
+        counts = _mapping(stats.get(weapon))
+        hits, shots = _battles(counts.get("hits")), _battles(counts.get("shots"))
+        if hits is not None and shots is not None and hits <= shots:
+            yield field, hits, shots, battles, "比例", _WEAPONS[weapon] + "已知命中／发射次数"
+    received, dealt = stats.get("damage_received"), stats.get("damage_dealt")
+    if _finite(received):
+        yield "avg_damage_received", received, battles, battles, "场均", "同模式记录中的实际承伤"
+        if _finite(dealt):
+            yield "damage_received_to_dealt_ratio", received, dealt, battles, "比值", "相同记录中的实际承伤／造伤"
+
+
+def _style_rows(records, total):
+    counters = {}
+    for stats in records:
+        for field, numerator, denominator, count, unit, scope in _style_counts(stats):
+            row = counters.setdefault(field, {"metric": field, "label": _STYLE_LABELS[field], "unit": unit,
+                                               "scope": scope, "numerator": 0, "denominator": 0, "battle_count": 0})
+            row["numerator"] += numerator
+            row["denominator"] += denominator
+            row["battle_count"] += count
+    result = []
+    for row in counters.values():
+        if (value := ratio(row["numerator"], row["denominator"])) is not None:
+            row["value"] = round(value, 4 if row["unit"] in ("比例", "比值") else 2)
+            row["coverage_ratio"] = round(row["battle_count"] / total, 4) if total else None
+            result.append(row)
+    return result
+
+
+def _class_performance(mode, rows, total, count, scope):
+    groups = defaultdict(list)
+    for row in rows:
+        groups[_class_label(row["species"])].append(row)
+    for species, records in sorted(groups.items(), key=lambda pair: sum(row["battles"] for row in pair[1]), reverse=True):
+        battles = sum(row["battles"] for row in records)
+        tiers = _distribution(records, "tier", _tier_label)
+        metrics = _style_rows((row["statistics"] for row in records), battles)
+        yield {"mode": mode, "species": species, "count": battles, "denominator": total,
+               "share": round(battles / total, 4), "account_battles": count, "scope": scope,
+               "tier_distribution": [{field: row[field] for field in ("label", "count", "share")} for row in tiers],
+               "support": [{field: value for field, value in row.items() if field != "scope"} for row in metrics]}
 
 
 def _account_metrics(stats):
@@ -326,6 +407,7 @@ def build_career_profile_evidence(profile, target, snapshot_record):
     random_entry = _mapping(modes.get("pvp"))
     references = _mapping(raw.get("rating_references"))
     random_stats = _mode_stats(random_entry)
+    random_count = _battles(random_stats.get("battles"))
     random_status, fleet = _fleet(random_entry, "pvp", references)
     facts = []
 
@@ -340,7 +422,7 @@ def build_career_profile_evidence(profile, target, snapshot_record):
         add("career_random_summary", "随机战公开累计：" + _metrics_text(summary) + "。",
             {"mode": "pvp", "support": summary, "source_fields": ["mode_results.pvp.account.statistics"]})
 
-    activity, summaries, fleets = [], [], []
+    activity, summaries, fleets, style, class_style = [], [], [], [], []
     for mode, label in MODE_NAMES.items():
         entry = _mapping(modes.get(mode))
         stats = _mode_stats(entry)
@@ -348,6 +430,8 @@ def build_career_profile_evidence(profile, target, snapshot_record):
         scope = "随机战分项" if mode in _RANDOM_DIVISION_MODES else "独立统计字段"
         account = {"mode": mode, "label": label, "count": count, "scope": scope,
                    "status": "unknown" if count is None else "known"}
+        if mode in _RANDOM_DIVISION_MODES and random_count and count is not None and count <= random_count:
+            account.update(denominator=random_count, share=round(count / random_count, 4))
         activity.append(account)
         summaries.append({**account, "support": _metrics_rows(_account_metrics(stats), METRIC_LABELS)})
         status, rows = (random_status, fleet) if mode == "pvp" else _fleet(entry, mode, references)
@@ -361,6 +445,14 @@ def build_career_profile_evidence(profile, target, snapshot_record):
                        "class_distribution": _distribution(rows, "species", _class_label),
                        "tier_distribution": _distribution(rows, "tier", _tier_label),
                        "favorite_ships": _favorites(rows, total, flat=True)})
+        measured = _style_rows([stats], count)
+        if count:
+            known = {row["metric"] for row in measured}
+            missing = [metric for metric in ("damage_received_to_dealt_ratio", "survival_rate", *_SUPPORT_TOTALS,
+                                             *_HIT_RATE_FIELDS.values()) if metric not in known]
+            style.append({**account, "status": "available" if measured else "unknown", "support": measured,
+                          "unknown": [_STYLE_LABELS[metric] for metric in missing]})
+        class_style.extend(_class_performance(mode, rows, total, count, scope))
     if any(row["status"] == "known" for row in activity):
         add("career_mode_activity", "各战斗模式按公开字段分别计数。单排、双排和三排属于随机战分项。",
             {"support": activity, "source_fields": ["mode_results.*.account.statistics.battles"]})
@@ -398,5 +490,13 @@ def build_career_profile_evidence(profile, target, snapshot_record):
          "unknown": "缺少逐舰数据的模式保留未知；舰种或等级未识别的出场仍计入逐舰分母。"})
     text, comparison = _server_comparison(region, fleet, random_stats)
     add("career_server_comparison", text, comparison)
+    add("career_combat_style", "同一模式内对照输出、存活、占领、防守、侦察与武器命中。实际承伤只采用明确记录，潜在承伤单列。",
+        {"status": "available" if any(mode["support"] for mode in style) else "unknown",
+         "support": style, "source_fields": ["mode_results.*.account.statistics"],
+         "unknown": "公开接口通常缺少实际承伤字段，舰载机也常缺少命中与发射计数。"})
+    add("career_class_performance", "按同模式逐舰资料分组，组内等级占比以本组场次为分母。指标口径同 P11，按对应场次或武器发射次数加权。",
+        {"status": "available" if class_style else "unknown", "support": class_style,
+         "source_fields": ["mode_results.*.ships"],
+         "unknown": "逐舰统计可能未覆盖全部账号场次。比较时考虑样本数、舰种与等级差异。"})
     return {"kind": "career_profile", "report_contract": CAREER_PROFILE_CONTRACT,
             "source_name": "公开账号资料", "evidence": facts}

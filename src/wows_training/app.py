@@ -80,7 +80,7 @@ def main():
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("WOWSTraining")
-    app.setApplicationDisplayName("WOWS 港口开发部")
+    app.setApplicationDisplayName("")
     try:
         window = MainWindow(args.data_dir or default_data_directory(), args.bundle)
     except Exception as exc:

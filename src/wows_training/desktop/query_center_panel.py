@@ -17,6 +17,7 @@ from .layered_panel import LayeredPanel
 from . import academy_palette as tone
 from .ui_components import Disclosure
 from .account_exhibit import AccountExhibit, ConstellationBackdrop, InteractiveDonut
+from .achievement_gallery import AchievementGallery, ShipCollectionSummary
 from .clan_summary import ClanSummary
 from .ship_comparison_summary import ShipComparisonSummary
 
@@ -244,9 +245,8 @@ class QueryCenterPanel(QWidget):
         composition.addWidget(self.tier_donut,1)
         exhibit_box.addLayout(composition)
         overview_box.addWidget(self.constellation,1)
-        self.styles = plain_label(); self.challenges = plain_label()
+        self.styles = plain_label()
         overview_box.addWidget(Disclosure('风格与战力修正',self.styles))
-        overview_box.addWidget(Disclosure('挑战记录',self.challenges))
         self.over_class.currentIndexChanged.connect(self._overview)
         self.over_tier.currentIndexChanged.connect(self._overview)
         self.over_class.setAccessibleName('总览舰种范围')
@@ -270,6 +270,8 @@ class QueryCenterPanel(QWidget):
         self.ship_name = QLineEdit(); self.ship_name.setPlaceholderText('筛选舰名'); self.ship_name.setClearButtonEnabled(True)
         self.min_battles = QSpinBox(); self.min_battles.setRange(1,99999); self.min_battles.setPrefix('至少 '); self.min_battles.setSuffix(' 场')
         search_ship.addWidget(self.ship_name,1); search_ship.addWidget(self.min_battles); ships_box.addLayout(search_ship)
+        self.ship_collections = ShipCollectionSummary()
+        ships_box.addWidget(self.ship_collections)
         self.distribution = CareerDistribution(); ships_box.addWidget(self.distribution)
         self.ranking_note = plain_label(); ships_box.addWidget(self.ranking_note)
         self.ranking_note.hide()
@@ -305,6 +307,8 @@ class QueryCenterPanel(QWidget):
             self.profile_ai.idle.connect(self.idle)
             self.profile_ai.busy_state.connect(lambda busy: self.inputs.setEnabled(not busy and self.job is None))
             self.tabs.addTab(self.profile_ai, 'AI 画像')
+        self.achievements = AchievementGallery(self.tabs)
+        self.tabs.addTab(self.achievements, '成就展厅')
         for w in (self.ship_class,self.ship_tier,self.nation,self.sort):
             w.currentIndexChanged.connect(self._ship_rows)
         self.limit.valueChanged.connect(self._ship_rows)
@@ -587,10 +591,8 @@ class QueryCenterPanel(QWidget):
         mod_names = {'challenge':'挑战','horse':'舰种构成','variety':'舰种多样性','veteran':'参战经验'}
         factors = [f"{mod_names[k]} ×{v:.2f}" for k,v in mods.items() if k in mod_names and isinstance(v,(int,float))]
         self.styles.setText('\n'.join(styles + factors) or '资料不足')
-        achievements = ['　'.join(str(x) for x in row[:2]) for row in self.detail['challenges']]
-        if not self.detail.get('challenge_complete_data'):
-            achievements.append('部分快照字段或战斗成就未知')
-        self.challenges.setText('\n'.join(achievements) or '尚无达成记录')
+        self.achievements.set_detail(self.detail, (profile.get('region'), profile.get('account_id')))
+        self.ship_collections.set_records(self.detail.get('ship_collections'))
         self.card_btn.setEnabled(bool(profile.get('metrics',{}).get('battles')))
 
     def _modes(self,*_):

@@ -1,6 +1,6 @@
 interface:
   display_name: "战舰世界战绩画像"
-  short_description: "结合各战斗模式、常用舰船和同服同舰参考概括玩家的公开战绩"
-  default_prompt: "使用 $wows-career-profile，依据本次的公开账号战绩快照概括舰船偏好、游玩风格与参战经历。"
+  short_description: "结合用船分布、武器命中和战斗贡献解读玩家公开战绩"
+  default_prompt: "使用 $wows-career-profile，根据公开战绩快照，交叉比较用船选择、火力表现、生存与团队贡献。"
 policy:
   allow_implicit_invocation: true

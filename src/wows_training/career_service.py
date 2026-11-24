@@ -13,6 +13,7 @@ import sys
 import time
 from urllib.request import Request,build_opener
 
+from .career_catalog import enrich_ship_catalog
 from .career_rating import metrics,project_ships,summarize_ships,number,mechanical_means
 from .credential_store import SecretStore, SecretStoreError
 from .public_stats import PublicStatsClient,REGIONS,ACCOUNT_MODES,MODES,_positive_id,_NoRedirect
@@ -132,7 +133,7 @@ class CareerService:
         self.legacy_references=deepcopy(self.references.get('legacy') or {k:self.references.get(k,{}) for k in ('expected','encyclopedia','benchmarks','metadata')})
         self.legacy_references['legacy_only']=True
         self.reference_transport=reference_transport or _fetch_expected
-        self.catalog=bundle.ship_catalog() if bundle is not None else {}
+        self.catalog=enrich_ship_catalog(bundle.ship_catalog()) if bundle is not None else {}
         self._reference_id=None;self._encyclopedia_id=None
         self._reload_reference()
 
@@ -261,7 +262,7 @@ class CareerService:
             'encyclopedia':{sid:deepcopy(refs.get('encyclopedia',{}).get(sid)) for sid in ids if sid in refs.get('encyclopedia',{})},
             'benchmarks':deepcopy(refs.get('benchmarks') or {}),'metadata':deepcopy(refs.get('metadata') or {}),
             'mechanical_means':mechanical_means(refs.get('encyclopedia') or {}),'legacy_only':payload.get('source_type')=='legacy_cache',
-            'local_catalog':{sid:{key:deepcopy(self.catalog[sid][key]) for key in ('display_name','internal_name','species','tier','nation','index') if key in self.catalog[sid]} for sid in ids if sid in self.catalog}}
+            'local_catalog':{sid:{key:deepcopy(self.catalog[sid][key]) for key in ('display_name','internal_name','species','tier','nation','index','client_build') if key in self.catalog[sid]} for sid in ids if sid in self.catalog}}
 
     def _records(self,region=None,account_id=None):
         if region is None:

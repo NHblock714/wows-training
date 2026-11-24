@@ -252,7 +252,7 @@ class HomePanel(QWidget):
         )
         intro.addWidget(title)
         intro.addSpacing(8)
-        desc = QLabel("导入战舰世界录像，查看对局和战绩，整理赛训报告。")
+        desc = QLabel("导入战舰世界录像，查看对局和战绩，整理分析报告。")
         desc.setWordWrap(True)
         desc.setStyleSheet("color:#345A80;")
         intro.addWidget(desc)

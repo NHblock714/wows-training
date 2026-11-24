@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QLineF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
-from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from ..ai_analysis import compact_brief
 from ..replay_intel import number
@@ -17,6 +17,7 @@ from .presentation_fonts import load_presentation_fonts
 
 _HEADINGS = ('舰船偏好', '游玩风格', '游戏经验')
 _ACCENTS = ('#176CB3', '#A53671', '#167C8C')
+_MIX_COLORS = ('#377CAD', '#CC7B9B', '#47A5B3', '#A8BDC9')
 _PARENT_MODES = (
     ('随机战', ('pvp',)), ('排位', ('rank_solo',)), ('行动', ('oper_solo', 'oper_div')),
     ('联合', ('pve',)), ('公会', ('club',)),
@@ -24,6 +25,13 @@ _PARENT_MODES = (
 _LEGACY_RATE_NOTE = re.compile(
     r'胜率和\s*PR\s*是单排与分队的合计表现\s*[，,]\s*不能直接视为单排或排位水平[。.!！]?',
     re.IGNORECASE,
+)
+_COMBAT_READINGS = (
+    (('main_battery_hit_rate', '主炮命中率'), ('torpedo_hit_rate', '鱼雷命中率'),
+     ('second_battery_hit_rate', '副炮命中率'), ('aircraft_hit_rate', '舰载机命中率')),
+    (('damage_received_to_dealt_ratio', '实际承伤 ÷ 造伤'), ('survival_rate', '存活率')),
+    (('avg_scouting_damage', '场均侦察伤害'), ('avg_dropped_capture_points', '场均防守点数'),
+     ('avg_capture_points', '场均占领点数')),
 )
 
 
@@ -82,6 +90,69 @@ def _chips(request):
                           f'参考 {reference:{spec}} · {matched:,.0f}/{total:,.0f} 场'))
             break
     return chips
+
+
+def _combat_readings(request):
+    """One weapon, one exchange or survival measure and one team contribution."""
+    row = next((item for item in _rows(request.get('evidence')) if isinstance(item, dict)
+                and item.get('kind') == 'career_combat_style'), {})
+    details = row.get('details')
+    if not isinstance(details, dict):
+        return '', []
+    parent_modes = {mode for _, modes in _PARENT_MODES for mode in modes}
+    modes = [item for item in _rows(details.get('support')) if isinstance(item, dict)
+             and isinstance(item.get('mode'), str) and isinstance(item.get('label'), str)
+             and number(item.get('count')) and item['count'] > 0
+             and _rows(item.get('support'))]
+    modes.sort(key=lambda item: (item.get('mode') in parent_modes, item['count']), reverse=True)
+    for mode in modes:
+        by_metric = {entry['metric']: entry for entry in mode['support'] if isinstance(entry, dict)
+                     and isinstance(entry.get('metric'), str) and number(entry.get('value')) and entry['value'] >= 0}
+        readings = []
+        for group in _COMBAT_READINGS:
+            for key, label in group:
+                entry = by_metric.get(key)
+                if entry is None:
+                    continue
+                value = entry['value']
+                rate = key.endswith('_rate')
+                if rate and value > 1:
+                    continue
+                formatted = (f'{value:.1%}' if rate else
+                             f'{value:.2f}' if key == 'damage_received_to_dealt_ratio' else f'{value:,.1f}'.removesuffix('.0'))
+                coverage = entry.get('coverage_ratio')
+                if number(coverage) and 0 < coverage < 1:
+                    label += '（部分样本）'
+                readings.append((label, formatted, value if rate else None))
+                break
+        if readings:
+            return mode['label'], readings
+    return '', []
+
+
+def _fleet_mix(request):
+    row = next((item for item in _rows(request.get('evidence')) if isinstance(item, dict)
+                and item.get('kind') == 'career_mode_fleets'), {})
+    details = row.get('details')
+    if not isinstance(details, dict):
+        return '', []
+    fleets = [item for item in _rows(details.get('support')) if isinstance(item, dict)
+              and isinstance(item.get('label'), str) and number(item.get('denominator'))
+              and item['denominator'] > 0 and item.get('status') == 'available']
+    if not fleets:
+        return '', []
+    fleet = max(fleets, key=lambda item: item['denominator'])
+    bands = []
+    for key, title in (('class_distribution', '舰种占比'), ('tier_distribution', '等级占比')):
+        shares = [(entry['label'], entry['share']) for entry in _rows(fleet.get(key))
+                  if isinstance(entry, dict) and isinstance(entry.get('label'), str)
+                  and number(entry.get('share')) and 0 < entry['share'] <= 1]
+        shares.sort(key=lambda entry: entry[1], reverse=True)
+        total = sum(share for _, share in shares)
+        if shares and .99 <= total <= 1.01:
+            tail = sum(share for _, share in shares[3:])
+            bands.append((title, shares[:3] + ([('其余', tail)] if tail else [])))
+    return fleet['label'], bands
 
 
 def portrait_content(payload):
@@ -162,8 +233,31 @@ class _PortraitPanel(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(frame)
             p.fillRect(QRectF(17, 1, 79 if self.featured else 43, 3), QColor(self.accent))
+            p.setPen(QPen(QColor(self.accent), 2 if self.featured else 1))
+            p.drawLine(QLineF(bounds.right() - 36, bounds.bottom() - 9, bounds.right() - 19, bounds.bottom() - 9))
+            p.drawLine(QLineF(bounds.right() - 19, bounds.bottom() - 9, bounds.right() - 13, bounds.bottom() - 15))
         finally:
             p.end()
+
+
+class _MixBand(QWidget):
+    def __init__(self, shares):
+        super().__init__()
+        self.shares = shares
+        self.setFixedHeight(7)
+        self.setAccessibleName(' · '.join(f'{label} {share:.0%}' for label, share in shares))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        try:
+            x = 0.
+            total = sum(share for _, share in self.shares)
+            for (_, share), color in zip(self.shares, _MIX_COLORS):
+                width = self.width() * share / total
+                painter.fillRect(QRectF(x, 0, max(0, width - 1), self.height()), QColor(color))
+                x += width
+        finally:
+            painter.end()
 
 
 class PortraitView(QScrollArea):
@@ -204,7 +298,7 @@ class PortraitView(QScrollArea):
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setSpacing(12)
         self._panels = []
-        for accent in _ACCENTS:
+        for index, accent in enumerate(_ACCENTS):
             panel = _PortraitPanel(accent)
             card = QVBoxLayout(panel)
             card.setContentsMargins(18, 14, 23, 16)
@@ -213,6 +307,20 @@ class PortraitView(QScrollArea):
             text = _label(pixels=15)
             card.addWidget(title)
             card.addWidget(text)
+            if index == 0:
+                self._distribution = QWidget()
+                self._distribution_layout = QVBoxLayout(self._distribution)
+                self._distribution_layout.setContentsMargins(0, 7, 0, 0)
+                self._distribution_layout.setSpacing(4)
+                card.addWidget(self._distribution)
+            elif index == 1:
+                self._signals = QWidget()
+                self._signals_layout = QGridLayout(self._signals)
+                self._signals_layout.setContentsMargins(0, 7, 0, 0)
+                self._signals_layout.setSpacing(6)
+                self._signals_layout.setColumnStretch(0, 1)
+                self._signals_layout.setColumnStretch(1, 1)
+                card.addWidget(self._signals)
             card.addStretch(1)
             self._panels.append((panel, title, text))
         box.addWidget(self._cards)
@@ -238,6 +346,11 @@ class PortraitView(QScrollArea):
         self.conclusion.setText(conclusion)
         self.conclusion.setVisible(bool(conclusion))
         self._show_chips(chips)
+        request = payload.get('request')
+        request = request if isinstance(request, dict) else {}
+        self._show_mix(*_fleet_mix(request if sections and sections[0][0] == _HEADINGS[0] else {}))
+        show_style = len(sections) > 1 and sections[1][0] == _HEADINGS[1]
+        self._show_readings(*_combat_readings(request if show_style else {}))
         self.hero.show()
         self._section_count = len(sections)
         for index, (panel, title, text) in enumerate(self._panels):
@@ -269,6 +382,49 @@ class PortraitView(QScrollArea):
                 group.addWidget(_label(note, pixels=12, ink=tone.MUTED))
             self._metric_layout.addWidget(chip, 1)
         self.metrics.setVisible(bool(chips))
+
+    def _show_mix(self, mode, bands):
+        while self._distribution_layout.count():
+            item = self._distribution_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._distribution.setVisible(bool(bands))
+        for index, (title, shares) in enumerate(bands):
+            if index:
+                self._distribution_layout.addSpacing(5)
+            self._distribution_layout.addWidget(_label(f'{mode} · {title}', pixels=12, ink=tone.MUTED))
+            self._distribution_layout.addWidget(_MixBand(shares))
+            legend = '　'.join(f'{label} {share:.0%}' for label, share in shares)
+            self._distribution_layout.addWidget(_label(legend, pixels=12, ink=tone.INK))
+
+    def _show_readings(self, mode, readings):
+        while self._signals_layout.count():
+            self._signals_layout.takeAt(0).widget().deleteLater()
+        self._signals.setVisible(bool(readings))
+        if not readings:
+            return
+        self._signals_layout.addWidget(_label(mode, pixels=12, ink=tone.MUTED), 0, 0, 1, 2)
+        for index, (label, value, fraction) in enumerate(readings):
+            chip = QFrame()
+            chip.setObjectName('careerCombatReading')
+            chip.setStyleSheet('QFrame#careerCombatReading { background:#F5F9FD; border:1px solid #B6CDD9; border-radius:5px; }')
+            content = QVBoxLayout(chip)
+            content.setContentsMargins(9, 6, 9, 7)
+            content.setSpacing(2)
+            content.addWidget(_label(label, pixels=12, ink=tone.MUTED))
+            content.addWidget(_label(value, pixels=17, weight=QFont.Weight.DemiBold, ink='#185679'))
+            if fraction is not None:
+                line = QProgressBar()
+                line.setFixedHeight(4)
+                line.setTextVisible(False)
+                line.setRange(0, 1000)
+                line.setValue(round(fraction * 1000))
+                line.setAccessibleName(label)
+                line.setStyleSheet('QProgressBar { border:0; background:#DCEAF4; }'
+                                   'QProgressBar::chunk { border:0; background:#3C9EC5; }')
+                content.addWidget(line)
+            span = 2 if index == len(readings) - 1 and index % 2 == 0 else 1
+            self._signals_layout.addWidget(chip, 1 + index // 2, index % 2, 1, span)
 
     def _reflow(self):
         columns = 2 if self.viewport().width() >= 760 and self._section_count > 1 else 1

@@ -2,6 +2,8 @@
 from collections import defaultdict
 import math
 
+from .career_catalog import ship_edition
+
 ALGORITHM='f1-career-pr-1'
 
 
@@ -108,12 +110,15 @@ def project_ships(records,mode,references,catalog=None):
         pr=personal_rating(values);kind=legacy.get('type') or native.get('species');tier=legacy.get('tier',native.get('tier'))
         art=mechanical_accuracy((legacy.get('default_profile') or {}).get('artillery'))
         result.append({'ship_id':sid,'name':native.get('display_name') or legacy.get('name') or native.get('internal_name') or sid,
-            'species':kind,'tier':tier,'nation':legacy.get('nation') or native.get('nation'),**value,
+            'species':kind,'tier':tier,'nation':legacy.get('nation') or native.get('nation'),
+            'edition':ship_edition(sid),**value,
             'pr':pr,'normalized_pr':values,'ship_battle_power':ship_power(pr,value['battles']),
             'mechanical_hit_factor':art/means[kind] if art and means.get(kind) else None,
             'legacy_metadata_known':bool(legacy),
             'rating_metadata_known':bool(legacy) if references.get('legacy_only') else bool(legacy or native),
-            'metadata_source':'official_encyclopedia' if legacy else 'local_client_15_9' if native else 'unknown',
+            'metadata_source':('official_encyclopedia' if legacy else
+                               'local_client_15_10' if native.get('client_build') else
+                               'local_client_15_9' if native else 'unknown'),
             'pr_status':'known' if pr is not None else 'mode_not_supported' if mode!='pvp' else 'expected_values_missing',
             'last_battle_time':row.get('last_battle_time')})
     return sorted(result,key=lambda row:(-(row['battles'] or 0),row['name'],row['ship_id']))
