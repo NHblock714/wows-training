@@ -1,24 +1,32 @@
 """Account and clan lookup, ship comparisons and public battle cards."""
 from __future__ import annotations
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView,
+from sqlite3 import Error as StorageError
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView,
     QFrame, QGridLayout, QLineEdit, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget)
 
-from ..career_rating import metrics
+from ..career_rating import metrics, project_ships
+from ..dog_tags import fetch_dog_tag
 from ..query_center import QueryCenter, player_target
+from ..shared_profile import SharedProfileError, load_shared_profile, parse_share_link
 from .fleet_shell import FleetPageHeader
 from .multiview_panel import RecordingJob
 from .player_dossier_panel import CLASS_NAMES, MODES, REGIONS, count_text, percent, query_status, time_text
 from .query_visuals import CareerDistribution, RadarFocusOverlay, RatingRadar, SnapshotCardDialog, axis_title, plain_label
+from .career_rating_visuals import RatingMetricCard, install_rating_delegate, style_rating_item
 from .statistics_visuals import MetricCard
 from .layered_panel import LayeredPanel
 from . import academy_palette as tone
 from .ui_components import Disclosure
-from .account_exhibit import AccountExhibit, ConstellationBackdrop, InteractiveDonut
+from .account_exhibit import AccountExhibit, CareerInstrumentRow, ConstellationBackdrop, InteractiveDonut
 from .achievement_gallery import AchievementGallery, ShipCollectionSummary
 from .clan_summary import ClanSummary
+from .hidden_career_card import HiddenCareerCard
+from .dog_tag_visual import compose_dog_tag_png, dog_tag_image
+from .query_favorites import QueryFavorites
+from .query_history_picker import QueryHistoryPicker
 from .ship_comparison_summary import ShipComparisonSummary
 
 
@@ -125,6 +133,8 @@ class QueryCenterPanel(QWidget):
         self._service = None
         self.job = None
         self.target = self.profile = self.clan = self.detail = None
+        self._shared_profile = None
+        self._active_dog_tag_png = None
         self.frames = {}
         self.peer = None
         self._picker_context = None
@@ -164,16 +174,26 @@ class QueryCenterPanel(QWidget):
         self.text.returnPressed.connect(self.search)
         fields.addLayout(search)
         saved = QHBoxLayout()
-        self.saved = combo(); self.candidates = combo([(None, '搜索候选')])
-        self.saved.setAccessibleName('常用与缓存'); self.candidates.setAccessibleName('搜索候选')
-        self.saved.activated.connect(self._open_saved)
+        self.saved = QueryHistoryPicker(); self.candidates = combo([(None, '搜索候选')])
+        self.candidates.setAccessibleName('搜索候选')
+        self.saved.targetOpened.connect(self._open_saved)
+        self.saved.clearRequested.connect(self._clear_history)
         saved.addWidget(self.saved, 1); saved.addWidget(self.candidates,1)
         saved.addWidget(button('打开所选',self.open_candidate))
-        self.mark = button('收藏',self.bookmark); self.mark.setEnabled(False)
-        saved.addWidget(self.mark)
         self.refresh_button = button('刷新当前',self.refresh_current); self.refresh_button.setEnabled(False)
         saved.addWidget(self.refresh_button)
         fields.addLayout(saved)
+        self.detail_actions = QWidget()
+        actions = QHBoxLayout(self.detail_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        self.back_to_favorites = button('← 返回收藏页', self.return_to_favorites)
+        self.mark = button('收藏', self.bookmark)
+        self.mark.setObjectName('queryToggleFavorite')
+        actions.addWidget(self.back_to_favorites)
+        actions.addStretch()
+        actions.addWidget(self.mark)
+        fields.addWidget(self.detail_actions)
+        self.detail_actions.hide()
         picker=QHBoxLayout()
         self.use_account_button=button('选用此账号',self.use_selected_account);self.use_account_button.setObjectName('queryUseAccount');self.use_account_button.hide();self.use_account_button.setEnabled(False)
         self.return_dossier_button=button('返回选手档案',self.cancel_account_picker);self.return_dossier_button.setObjectName('queryReturnDossier');self.return_dossier_button.hide()
@@ -187,55 +207,226 @@ class QueryCenterPanel(QWidget):
         status_row.addWidget(self.notice,1); status_row.addWidget(self.cancel_button)
         outer.addLayout(status_row)
         self.stack = QStackedWidget(); outer.addWidget(self.stack,1)
-        empty = ConstellationBackdrop()
-        self.stack.addWidget(empty)
+        self.favorites_page = QueryFavorites()
+        self.favorites_page.targetOpened.connect(self._open_saved)
+        self.stack.addWidget(self.favorites_page)
         self._build_player()
         self._build_clan()
+        self.hidden_account_page, hidden_box = form()
+        self.hidden_account = HiddenCareerCard()
+        self.hidden_account.shareLinkRequested.connect(self._request_shared_profile)
+        hidden_box.addWidget(self.hidden_account)
+        self._build_shared_profile_view(hidden_box)
+        self.stack.addWidget(self.hidden_account_page)
         self.radar_focus = RadarFocusOverlay(self)
         self.tabs.currentChanged.connect(self.radar_focus.reset)
         self.stack.currentChanged.connect(self.radar_focus.reset)
 
+    def _build_shared_profile_view(self, box):
+        self.shared_view, view = form()
+        actions = QHBoxLayout()
+        self.shared_heading = plain_label()
+        self.shared_heading.setObjectName('sectionTitle')
+        actions.addWidget(self.shared_heading, 1)
+        self.shared_mode = combo()
+        self.shared_mode.setAccessibleName('共享战绩的战斗模式')
+        self.shared_mode.currentIndexChanged.connect(self._render_shared_profile)
+        actions.addWidget(self.shared_mode)
+        actions.addWidget(button('关闭共享战绩', self._clear_shared_profile))
+        view.addLayout(actions)
+        self.shared_note = plain_label()
+        self.shared_note.setWordWrap(True)
+        view.addWidget(self.shared_note)
+        tabs = QTabWidget()
+        self.shared_mode_stats = table(['战绩指标', '当前模式'])
+        self.shared_mode_stats.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.shared_ship_stats = table(['舰船', '等级', '场次', '胜率', '场均经验', '场均伤害', '场均击沉'])
+        self.shared_ship_stats.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tabs.addTab(self.shared_mode_stats, '模式战绩')
+        tabs.addTab(self.shared_ship_stats, '舰船战绩')
+        view.addWidget(tabs, 1)
+        box.addWidget(self.shared_view, 1)
+        box.addStretch()
+        self.shared_view.hide()
+
+    def _request_shared_profile(self):
+        if (self.busy or self.stack.currentWidget() is not self.hidden_account_page
+                or (self.profile or {}).get('status') != 'private'):
+            return
+        target = dict(self.target)
+        dialog = QDialog(self)
+        dialog.setObjectName('sharedCareerLinkDialog')
+        dialog.setWindowTitle('通过链接查看战绩')
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.resize(500, 160)
+        layout = QVBoxLayout(dialog)
+        label = plain_label('粘贴该玩家从官网「仅通过链接开放」设置中复制的查看链接。')
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        link_field = QLineEdit(dialog)
+        link_field.setObjectName('sharedCareerLink')
+        link_field.setAccessibleName('官方战绩查看链接')
+        link_field.setEchoMode(QLineEdit.EchoMode.Password)
+        link_field.setMaxLength(1024)
+        link_field.setPlaceholderText('粘贴官方查看链接')
+        layout.addWidget(link_field)
+        error_label = plain_label()
+        error_label.setWordWrap(True)
+        error_label.setStyleSheet('color:#A23550;')
+        error_label.hide()
+        layout.addWidget(error_label)
+
+        def submit():
+            link = link_field.text()
+            try:
+                parse_share_link(link, target['region'], target['id'])
+            except SharedProfileError as error:
+                error_label.setText(str(error))
+                error_label.show()
+                link_field.setFocus()
+                return
+            dialog.accept()
+            self._load_shared_profile(link, target)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button('取消', dialog.reject))
+        submit_button = button('读取战绩', submit)
+        submit_button.setObjectName('primary')
+        submit_button.setDefault(True)
+        submit_button.setEnabled(False)
+        link_field.textChanged.connect(lambda text: submit_button.setEnabled(bool(text.strip())))
+        actions.addWidget(submit_button)
+        layout.addLayout(actions)
+        dialog.finished.connect(link_field.clear)
+        dialog.open()
+        link_field.setFocus()
+
+    def _load_shared_profile(self, link, target):
+        region, identifier = target['region'], str(target['id'])
+        self._clear_shared_profile()
+
+        def load(cancel, _progress):
+            return load_shared_profile(link, region, identifier, cancel=cancel)
+
+        def show(value):
+            if (self.stack.currentWidget() is not self.hidden_account_page
+                    or not self.target or self.service.key(target) != self.service.key(self.target)
+                    or (value.get('region'), value.get('account_id')) != (region, identifier)):
+                self._say('共享资料与当前选中的账号不一致。')
+                return
+            self._shared_profile = value
+            self.shared_heading.setText('链接共享战绩')
+            notices = ['仅在本次查看中显示']
+            if value.get('account_created_at'):
+                notices.append('创建于 '+time_text(value['account_created_at']))
+            if value.get('achievements') is not None:
+                notices.append(f"已记录 {len(value['achievements'])} 种游戏成就")
+            self.shared_note.setText(' · '.join(notices))
+            modes = value['modes']
+            repopulate(self.shared_mode, [(key, MODES[key]) for key in MODES if key in modes], 'pvp')
+            self._render_shared_profile()
+            self.shared_view.show()
+            self._say('共享战绩已读取')
+
+        self._job(load, show, '正在向官方读取共享战绩…')
+
+    def _render_shared_profile(self, *_):
+        if self._shared_profile is None:
+            return
+        mode = self.shared_mode.currentData()
+        account = metrics(self._shared_profile['modes'].get(mode))
+        mode_rows = [(key, (title, value_text(key, account[key]))) for key, title in METRICS
+                     if account[key] is not None]
+        set_rows(self.shared_mode_stats, mode_rows or [(None, ('官方暂未返回模式战绩', ''))])
+        rows = self._shared_profile.get('ships')
+        if rows is None:
+            set_rows(self.shared_ship_stats, [(None, ('官方暂未返回舰船战绩', '', '', '', '', '', ''))])
+            return
+        mode_ships = [{'ship_id': row['ship_id'], 'statistics': row['modes'][mode]}
+                      for row in rows if mode in row['modes']]
+        ships = project_ships(mode_ships, mode, self.career.references, self.career.catalog)
+        ship_rows = [(row['ship_id'], (row['name'], row['tier'] or '—',
+                      *(value_text(key, row[key]) for key in ('battles', 'win_rate', 'avg_xp', 'avg_damage', 'avg_frags'))))
+                     for row in ships if row.get('battles')]
+        set_rows(self.shared_ship_stats, ship_rows or [(None, ('当前模式暂无舰船战绩', '', '', '', '', '', ''))])
+
+    def _clear_shared_profile(self):
+        self._shared_profile = None
+        self.shared_view.hide()
+        self.shared_note.clear()
+        self.shared_mode_stats.setRowCount(0)
+        self.shared_ship_stats.setRowCount(0)
+
     def _build_player(self):
         page, box = form(); self.stack.addWidget(page)
         head = QHBoxLayout()
+        identity = QFrame()
+        identity.setObjectName('queryPlayerIdentity')
+        identity.setStyleSheet('QFrame#queryPlayerIdentity {border-left:3px solid #177BB1;}')
+        identity_row = QHBoxLayout(identity)
+        identity_row.setContentsMargins(9, 0, 0, 0)
+        identity_row.setSpacing(8)
+        self.player_dog_tag = plain_label()
+        self.player_dog_tag.setObjectName('queryPlayerDogTag')
+        self.player_dog_tag.setAccessibleName('玩家铭牌')
+        self.player_dog_tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.player_dog_tag.setFixedSize(35, 35)
+        self.player_dog_tag.hide()
+        identity_row.addWidget(self.player_dog_tag)
         self.player_heading = plain_label(); self.player_heading.setObjectName('sectionTitle')
-        head.addWidget(self.player_heading,1)
+        self.player_heading.setStyleSheet('color:#193C59;font-size:21px;')
+        identity_row.addWidget(self.player_heading, 1)
+        head.addWidget(identity, 1)
         self.card_btn = button('战绩名片',self.open_card)
         head.addWidget(self.card_btn); head.addWidget(button('个人档案',self.open_dossier)); box.addLayout(head)
         self.tabs = QTabWidget(); box.addWidget(self.tabs,1)
         overview, overview_box = form()
+        overview_box.setContentsMargins(6, 7, 6, 8)
+        overview_box.setSpacing(8)
         scroller = self.overview_scroll = QScrollArea(); scroller.setWidgetResizable(True); scroller.setWidget(overview)
         self.tabs.addTab(scroller,'总览')
         kpis = QHBoxLayout()
         self.account_metrics = {}
         for key, title in (('pr','随机战 PR'),('power','综合战力'),('battles','随机战场次'),('wins','随机战胜率')):
-            metric = MetricCard(title)
-            kpis.addWidget(metric, 1)
+            metric = RatingMetricCard(title, power=key=='power') if key in ('pr','power') else MetricCard(title)
+            metric.layout().setContentsMargins(15, 7, 24, 8)
+            kpis.addWidget(metric, 6 if key=='power' else 5)
             self.account_metrics[key] = metric
-        overview_box.addLayout(kpis)
-        filters = QHBoxLayout()
-        self.over_class = combo(); self.over_tier = combo()
-        filters.addWidget(self.over_class); filters.addWidget(self.over_tier); filters.addStretch()
-        self.summary = plain_label(); self.summary.setObjectName('sectionTitle')
-        filters.addWidget(self.summary)
-        self.overview_zoom = button('放大雷达', self.expand_overview)
-        filters.addWidget(self.overview_zoom)
-        overview_box.addLayout(filters)
         self.constellation = ConstellationBackdrop()
         exhibit_box = QVBoxLayout(self.constellation)
-        exhibit_box.setContentsMargins(4,6,4,8)
-        exhibit_box.setSpacing(12)
-        graphs = QHBoxLayout()
-        self.radar = RatingRadar()
-        self.radar.setMinimumHeight(344)
+        exhibit_box.setContentsMargins(0, 0, 0, 0)
+        exhibit_box.setSpacing(9)
+        stage = QWidget()
+        stage_box = QVBoxLayout(stage)
+        stage_box.setContentsMargins(0, 0, 0, 0)
+        stage_box.setSpacing(0)
+        toolbar = QFrame()
+        toolbar.setObjectName('careerRadarTools')
+        toolbar.setStyleSheet('QFrame#careerRadarTools {background:qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+                              'stop:0 #18384E,stop:0.65 #23526A,stop:1 #28485F);border-left:3px solid #57CDE1;}')
+        filters = QHBoxLayout(toolbar)
+        filters.setContentsMargins(10, 5, 7, 5)
+        filters.setSpacing(6)
+        title = plain_label('多维战力雷达')
+        title.setWordWrap(False)
+        title.setStyleSheet('font-size:16px;font-weight:600;color:#F1F9FC;background:transparent;')
+        filters.addWidget(title, 1)
+        self.over_class = combo(); self.over_tier = combo()
+        filters.addWidget(self.over_class); filters.addWidget(self.over_tier)
+        self.overview_zoom = button('放大雷达', self.expand_overview)
+        filters.addWidget(self.overview_zoom)
+        stage_box.addWidget(toolbar)
+        self.radar = RatingRadar(enlarged=True)
+        self.radar.setMinimumHeight(362)
         self.radar.axisActivated.connect(self.inspect_overview_axis)
-        graphs.addWidget(self.radar,3)
+        stage_box.addWidget(self.radar, 1)
         self.account_exhibit = AccountExhibit()
         self.constellation.phaseChanged.connect(self.radar.set_ambient_phase)
         self.constellation.phaseChanged.connect(self.account_exhibit.set_ambient_phase)
         self.account_exhibit.aceRequested.connect(self.open_ace_ship)
-        graphs.addWidget(self.account_exhibit,2)
-        exhibit_box.addLayout(graphs)
+        exhibit_box.addWidget(CareerInstrumentRow(stage, self.account_exhibit), 1)
+        exhibit_box.addLayout(kpis)
         composition = QHBoxLayout()
         self.class_donut = InteractiveDonut('class')
         self.tier_donut = InteractiveDonut('tier')
@@ -276,7 +467,10 @@ class QueryCenterPanel(QWidget):
         self.ranking_note = plain_label(); ships_box.addWidget(self.ranking_note)
         self.ranking_note.hide()
         self.ship_table = table(['舰船','舰种','等级','场次','胜率','场均伤害','场均经验','场均击沉','生存率','PR','战力'])
-        self.ship_table.setMinimumHeight(110); self.ship_table.setColumnWidth(0,130)
+        install_rating_delegate(self.ship_table, 9, 10)
+        self.ship_table.setMinimumHeight(110)
+        for column, width in enumerate((122, 58, 46, 54, 58, 80, 72, 72, 63, 94, 90)):
+            self.ship_table.setColumnWidth(column, width)
         ships_box.addWidget(self.ship_table,1)
         peer_row = QHBoxLayout()
         self.peer_edit = QLineEdit(); self.peer_edit.setPlaceholderText('对比玩家昵称或 ID（同区服）')
@@ -346,18 +540,84 @@ class QueryCenterPanel(QWidget):
     def refresh(self):
         favorites, cached = self.service.bookmarks(), self.service.directory()
         marked = {self.service.key(x) for x in favorites}
-        entries = [(None,'常用与本地档案')]
-        for prefix, items in [('★ ',favorites),('',[x for x in cached if self.service.key(x) not in marked])]:
-            for row in items:
-                label = REGIONS[row['region']] + (' · 公会' if row['kind']=='clan' else '')
-                entries.append((row, f"{prefix}{row['name']} · {label}"))
-        repopulate(self.saved, entries)
-        self.mark.setEnabled(bool(self.target))
+        entries = []
+        for row in cached:
+            suffix = REGIONS[row['region']] + (' · 公会' if row['kind'] == 'clan' else '')
+            if self.service.key(row) in marked:
+                suffix += ' · 已收藏'
+            entries.append(dict(row, label=f"{row['name']} · {suffix}"))
+        self.saved.set_records(entries)
+        favorite_tags = self.service.cached_dog_tags((row['region'], row['id']) for row in favorites
+                                                     if row['kind'] == 'player')
+        self.favorites_page.set_records([dict(row, _dog_tag_png=favorite_tags.get((row['region'], str(row['id']))))
+                                         if row['kind'] == 'player' else row for row in favorites])
+        self.detail_actions.setVisible(bool(self.target) and self.stack.currentWidget() is not self.favorites_page)
         self.mark.setText('取消收藏' if self.target and self.service.key(self.target) in marked else '收藏')
         self.refresh_button.setEnabled(bool(self.target))
 
     def _clear_candidates(self, *_):
         repopulate(self.candidates, [(None,'搜索候选')])
+
+    def _clear_history(self, target):
+        if self.busy:
+            return
+        try:
+            self.service.clear_history(target)
+        except (StorageError, OSError, ValueError):
+            self._say('清除本地查询记录失败，请稍后重试。')
+            return
+        key = self.service.key(target)
+        candidate = self.candidates.currentData()
+        remaining = []
+        matched_search = False
+        for index in range(self.candidates.count()):
+            row = self.candidates.itemData(index)
+            if row is None:
+                continue
+            if self.service.key(row) == key:
+                matched_search = True
+            else:
+                remaining.append((row, self.candidates.itemText(index)))
+        repopulate(self.candidates, [(None, '搜索候选'), *remaining], candidate)
+        if (not remaining and self.region.currentData() == target['region']
+                and (matched_search or self.text.text().strip().casefold() in (target['name'].casefold(), str(target['id'])))):
+            self.text.clear()
+        if self.target and self.service.key(self.target) == key:
+            self._reset_lookup_view()
+        elif target['kind'] == 'player':
+            self._drop_cached_comparisons(target)
+        self.refresh()
+        self._say('已清除该条目的本地缓存与搜索记录。')
+
+    def _drop_cached_comparisons(self, target):
+        region, identifier = target['region'], str(target['id'])
+        if self.peer and (self.peer.get('region'), str(self.peer.get('account_id'))) == (region, identifier):
+            self.clear_peer()
+        if self.clan and self.clan['region'] == region:
+            self.clan['batch_players'].pop(identifier, None)
+            self.frames.pop(int(identifier), None)
+            self._render_clan()
+
+    def _reset_lookup_view(self):
+        self.target = self.profile = self.clan = self.detail = None
+        self._active_dog_tag_png = None
+        self.frames = {}
+        self.peer = None
+        self.peer_edit.clear()
+        self.peer_choices.clear()
+        self._clear_shared_profile()
+        self._clear_player_display()
+        self.member_table.setRowCount(0)
+        self.use_account_button.setEnabled(False)
+        self.stack.setCurrentWidget(self.favorites_page)
+
+    def return_to_favorites(self):
+        if self.busy:
+            return
+        self._reset_lookup_view()
+        self._say('')
+        self.refresh()
+        self.text.setFocus()
 
     def set_search(self, nickname, region=None):
         """Prefill a roster identity without performing any request."""
@@ -379,10 +639,7 @@ class QueryCenterPanel(QWidget):
         """Choose an exact public account while retaining the caller's identity."""
         self.set_search('',context.get('region'))
         self._picker_context=dict(context)
-        self.target=self.profile=self.clan=self.detail=None
-        if self.profile_ai is not None:
-            self.profile_ai.set_source()
-        self.stack.setCurrentIndex(0)
+        self._reset_lookup_view()
         self.use_account_button.show();self.use_account_button.setEnabled(False);self.return_dossier_button.show()
         self.refresh()
 
@@ -451,10 +708,8 @@ class QueryCenterPanel(QWidget):
             self._say(' · '.join([f'{len(rows)} 个候选', *reasons]))
         self._job(lambda cancel, progress: self.service.search(region,text,kind,cancel), shown, '搜索公开资料…')
 
-    def _open_saved(self):
-        target = self.saved.currentData()
-        if target:
-            self.open_target(target)
+    def _open_saved(self, target):
+        self.open_target({key: target[key] for key in ('kind', 'region', 'id', 'name')}, query_missing=True)
 
     def open_candidate(self):
         target = self.candidates.currentData()
@@ -462,6 +717,39 @@ class QueryCenterPanel(QWidget):
             self.open_target(target, query_missing=True)
         else:
             self._say('请先搜索并选择结果')
+
+    def _load_player_dog_tag(self, region, account_id, cancel, progress, *, online, force):
+        key = (region, str(account_id))
+        try:
+            cached = self.service.cached_dog_tags((key,)).get(key)
+        except (StorageError, OSError):
+            cached = None
+        if cancel.is_set() or not online or (cached and not force):
+            return cached
+        progress('读取玩家铭牌…')
+        layers = fetch_dog_tag(region, account_id, cancel=cancel)
+        png = compose_dog_tag_png(layers) if layers and not cancel.is_set() else None
+        if not png or cancel.is_set():
+            return cached
+        try:
+            self.service.save_dog_tag(region, account_id, png)
+        except (StorageError, OSError, ValueError):
+            pass
+        return png
+
+    def _show_player_dog_tag(self):
+        image = dog_tag_image(self._active_dog_tag_png)
+        if image.isNull():
+            self.player_dog_tag.clear()
+            self.player_dog_tag.hide()
+            return
+        pixel_ratio = self.player_dog_tag.devicePixelRatioF()
+        size = round(self.player_dog_tag.width() * pixel_ratio)
+        scaled = image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pixmap = QPixmap.fromImage(scaled)
+        pixmap.setDevicePixelRatio(pixel_ratio)
+        self.player_dog_tag.setPixmap(pixmap)
+        self.player_dog_tag.show()
 
     def open_target(self, target, query_missing=False, force=False, *, portrait=False):
         if self.busy:
@@ -475,20 +763,27 @@ class QueryCenterPanel(QWidget):
                     stored = self.service.refresh_clan(region, identifier, cancel, progress)
                 if stored and stored.get('snapshot_id'):
                     refs = self.service.cached_member_ships(stored) or {}
-                    return dict(stored, frames=self._frames_for(stored,refs,cancel,progress))
-                return stored or {'status':'not_fetched','reason':'no_snapshot'}
+                    return dict(stored, frames=self._frames_for(stored,refs,cancel,progress)), None
+                return stored or {'status':'not_fetched','reason':'no_snapshot'}, None
             profile = self.career.profile(region, identifier)
             if force or query_missing and not profile.get('snapshot_id'):
                 profile = self.career.refresh(region, identifier, 'pvp', cancel, progress, include_achievements=True,
-                                              include_all_fleets=True, record_failures=False)
-            return profile
-        def display(value):
+                                              include_all_fleets=True, record_failures=False, include_numbers_rankings=force)
+            if profile.get('status') not in ('ok', 'partial', 'no_battles', 'unsupported'):
+                return profile, None
+            png = self._load_player_dog_tag(region, identifier, cancel, progress, force=force,
+                                            online=(force or query_missing) and self.career.settings()['enabled'])
+            return profile, png
+        def display(result):
+            value, dog_tag_png = result
             if target['kind']=='player' and (value.get('region'),str(value.get('account_id')))!=(region,str(identifier)):
                 self._say('返回账号与所选账号不一致，未载入');return
             if value.get('status') in ('error','not_fetched') and self.target and self.service.key(target)==self.service.key(self.target) and (self.profile or self.clan):
                 self._say(query_status(value)+' · 当前显示已有快照')
                 return
+            self._clear_shared_profile()
             self.target = dict(target)
+            self._active_dog_tag_png = dog_tag_png
             self.peer = None; self.peer_choices.clear(); self.peer_edit.clear()
             if target['kind'] == 'clan':
                 self.profile = self.detail = None
@@ -507,15 +802,17 @@ class QueryCenterPanel(QWidget):
                 nickname=value.get('nickname')
                 self.target['name'] = nickname if nickname and nickname!=str(identifier) else target['name']
                 self._show_player()
-                if portrait and self.profile_ai is not None:
+                if portrait and self.stack.currentIndex() == 1 and self.profile_ai is not None:
                     self.tabs.setCurrentWidget(self.profile_ai)
             self.refresh()
             self.use_account_button.setEnabled(self._picker_context is not None and target['kind']=='player')
         self._job(load, display, '正在读取战绩…')
 
     def bookmark(self):
-        if self.target:
-            self.service.toggle_bookmark(self.target); self.refresh()
+        if self.target and not self.busy:
+            saved = self.service.toggle_bookmark(self.target)
+            self.refresh()
+            self._say('已固定到收藏页。' if saved else '已取消收藏。')
 
     def refresh_current(self):
         if self.target:
@@ -539,8 +836,12 @@ class QueryCenterPanel(QWidget):
     def _show_player(self):
         profile = self.profile
         if profile.get('status') not in ('ok','partial','no_battles','unsupported'):
-            if self.profile_ai is not None:
-                self.profile_ai.set_source()
+            self._clear_player_display()
+            if profile.get('status') == 'private':
+                self.hidden_account.set_account(self.target['name'], REGIONS.get(profile.get('region')))
+                self.stack.setCurrentWidget(self.hidden_account_page)
+                self._say('')
+                return
             self.stack.setCurrentIndex(0); self._say(self.target['name']+' · '+query_status(profile)); return
         self.stack.setCurrentIndex(1); self._loading = True
         ships = profile.get('ships') or []
@@ -553,6 +854,7 @@ class QueryCenterPanel(QWidget):
             repopulate(widget,[(None,'全部等级'),*((t,f'T{t}') for t in tiers)])
         repopulate(self.nation,[(None,'全部国家'),*((n,NATIONS.get(n,n)) for n in nations)])
         self.player_heading.setText(f"{profile['nickname']}  ·  {REGIONS[profile['region']]}")
+        self._show_player_dog_tag()
         self._loading = False
         self._overview(); self._modes(); self._ship_rows()
         if self.profile_ai is not None:
@@ -563,33 +865,82 @@ class QueryCenterPanel(QWidget):
                 except (KeyError, ValueError, OSError):
                     pass
             self.profile_ai.set_source(profile, self.target, snapshot)
-        self._say('' if profile.get('status')=='ok' else query_status(profile))
+        status = profile.get('numbers_rankings_status')
+        if profile.get('status') != 'ok':
+            self._say(query_status(profile))
+        elif status == 'ok':
+            self._say(f"单舰榜 · {profile['numbers_rankings_observed_on']}")
+        elif status == 'cached':
+            self._say(f"已保存的单舰榜 · {profile['numbers_rankings_observed_on']}")
+        elif status == 'unavailable':
+            self._say('战绩已刷新 · 单舰榜暂不可用')
+        else:
+            self._say('')
+
+    def _clear_player_display(self):
+        self.detail = None
+        self.player_heading.clear()
+        self.player_dog_tag.clear()
+        self.player_dog_tag.hide()
+        self.styles.clear()
+        self.mode_note.clear()
+        self.mode_stats.setRowCount(0)
+        for key, metric in self.account_metrics.items():
+            if key in ('pr', 'power'):
+                metric.set_rating(None, None)
+            else:
+                metric.set_value('—')
+        self.radar.set_scores({})
+        self.account_exhibit.set_profile({}, {})
+        for donut in (self.class_donut, self.tier_donut):
+            donut.set_records([], available=False)
+        self.achievements.set_detail({}, None)
+        self.ship_collections.set_records(None)
+        self.distribution.set_records([])
+        self.ranking_note.hide()
+        with QSignalBlocker(self.ship_table):
+            self.ship_table.setRowCount(0)
+        self.ship_radar.set_scores({})
+        self.ship_info.clear_summary()
+        self.ship_image.clear()
+        for button in (self.card_btn, self.overview_zoom, self.ship_zoom):
+            button.setEnabled(False)
+        if self.profile_ai is not None:
+            self.profile_ai.set_source()
+        self.tabs.setCurrentIndex(0)
 
     def _overview(self,*_):
         if self._loading or not self.profile:
             return
         self.radar_focus.reset()
+        from ..f1_ratings.personal_rating import ACHIEVEMENT_POWER_BONUSES, ACHIEVEMENT_POWER_CAP, SHIP_POOL_POWER_CAP
         from ..query_ratings import player_ratings
         profile = self.profile
         self.detail = player_ratings(self.career, profile, species=self.over_class.currentData(),
             tier=self.over_tier.currentData(), achievements=profile.get('achievements'))
-        scores = self.detail['scores']; self.radar.set_scores(scores)
+        self.radar.set_scores(self.detail['scores'], overall=self.detail['overall'])
         self.overview_zoom.setEnabled(len(self.radar.keys) >= 3)
         rating = profile.get('rating') or {}
         stats = profile.get('metrics') or {}
-        for key, text in (('pr',count_text(rating.get('pr'))),('power',count_text(self.detail['power'])),
-                          ('battles',count_text(stats.get('battles'))),('wins',percent(stats.get('win_rate')))):
-            self.account_metrics[key].set_value(text)
-        self.account_metrics['power'].setToolTip('含已确认挑战修正')
-        self.summary.setText(f"维度均分　{count_text(self.detail.get('overall'))}")
+        pr = rating.get('pr')
+        self.account_metrics['pr'].set_rating(pr, pr)
+        self.account_metrics['power'].set_rating(self.detail['power'], pr)
+        self.account_metrics['battles'].set_value(count_text(stats.get('battles')))
+        self.account_metrics['wins'].set_value(percent(stats.get('win_rate')))
+        rates = ' · '.join(f'{grade} +{bonus * 100:g}%' for grade, bonus in ACHIEVEMENT_POWER_BONUSES.items())
+        self.account_metrics['power'].setToolTip(
+            f'已达成成就按稀有度累加，最高 +{ACHIEVEMENT_POWER_CAP:.0%}\n{rates}\n'
+            f'船池按有随机战记录的不同战舰数取对数，最高 +{SHIP_POOL_POWER_CAP:.0%}\n数字颜色对应随机战 PR')
         self.account_exhibit.set_profile(profile,self.detail)
         fleet_known=profile.get('ships_status') in ('ok','no_battles')
         self.class_donut.set_records(profile.get('ships') or [],self.over_class.currentData(),available=fleet_known)
         self.tier_donut.set_records(profile.get('ships') or [],self.over_tier.currentData(),available=fleet_known)
         styles = [f'{row[0]}　+{count_text(row[3])}' for row in self.detail['styles']]
         mods = self.detail.get('modifiers') or {}
-        mod_names = {'challenge':'挑战','horse':'舰种构成','variety':'舰种多样性','veteran':'参战经验'}
-        factors = [f"{mod_names[k]} ×{v:.2f}" for k,v in mods.items() if k in mod_names and isinstance(v,(int,float))]
+        mod_names = {'challenge':'成就稀有度','horse':'舰种构成','variety':'舰种多样性',
+                     'veteran':'参战经验','ship_pool':'船池规模'}
+        factors = [f"{mod_names[k]} ×{v:.{4 if k in ('challenge', 'ship_pool') else 2}f}"
+                   for k, v in mods.items() if k in mod_names and isinstance(v, (int, float))]
         self.styles.setText('\n'.join(styles + factors) or '资料不足')
         self.achievements.set_detail(self.detail, (profile.get('region'), profile.get('account_id')))
         self.ship_collections.set_records(self.detail.get('ship_collections'))
@@ -626,11 +977,16 @@ class QueryCenterPanel(QWidget):
                 self.ranking_note.show()
             rows = positive
         rows.sort(key=lambda s: (s.get(sort) is None,-(s.get(sort) or 0),s['name']))
+        rows = rows[:self.limit.value()]
         old = self._ship_id()
         self.ship_table.blockSignals(True)
         set_rows(self.ship_table,[(r['ship_id'],[r['name'],CLASS_NAMES.get(r.get('species'),'未知'),r.get('tier') or '—',*[value_text(k,r.get(k)) for k in
-                 ('battles','win_rate','avg_damage','avg_xp','avg_frags','survival_rate','pr','ship_battle_power')]]) for r in rows[:self.limit.value()]])
-        idx = next((i for i,r in enumerate(rows[:self.limit.value()]) if r['ship_id']==old),0)
+                 ('battles','win_rate','avg_damage','avg_xp','avg_frags','survival_rate','pr','ship_battle_power')]]) for r in rows])
+        for index, row in enumerate(rows):
+            style_rating_item(self.ship_table.item(index, 9), row.get('pr'))
+            if row.get('ship_battle_power') is not None:
+                style_rating_item(self.ship_table.item(index, 10), row.get('pr'))
+        idx = next((i for i,r in enumerate(rows) if r['ship_id']==old),0)
         if self.ship_table.rowCount():
             self.ship_table.selectRow(idx)
         self.ship_table.blockSignals(False); self._ship_selected()
@@ -682,7 +1038,7 @@ class QueryCenterPanel(QWidget):
     def expand_overview(self):
         if self.profile:
             caption = ' · '.join((REGIONS[self.profile['region']], self.over_class.currentText(),
-                                  self.over_tier.currentText(), self.summary.text()))
+                                  self.over_tier.currentText()))
             self.radar_focus.present(self.radar, self.profile['nickname'], caption, self.overview_zoom)
 
     def _select_overview_filter(self, box, value):
@@ -711,13 +1067,15 @@ class QueryCenterPanel(QWidget):
         raw = entry[0] if entry else None
         if raw is None:
             observed = '未知'
-        elif key in ('胜率','主炮命中','🐴含量','隐藏🐴'):
+        elif key == '🐴含量':
+            observed = f'纯水面舰占比 {raw:.1%}'
+        elif key in ('胜率','主炮命中','隐藏🐴'):
             observed = f'{raw:.1%}'
         elif key == '击杀效率':
             observed = f'{raw:.2f}'
         else:
             observed = f'{raw:,.1f}'.rstrip('0').rstrip('.')
-        return f'{axis_title(key)}  {observed}　·　维度分 {chart._readout(key)}'
+        return f'{axis_title(key)}  {observed}　·　维度分 {chart._readout(key, include_grade=True)}'
 
     def inspect_overview_axis(self, key):
         self.expand_overview()
@@ -733,11 +1091,12 @@ class QueryCenterPanel(QWidget):
         if not self.profile or not self._ship_id():
             return
         ship = next(r for r in self.profile['ships'] if str(r['ship_id']) == str(self._ship_id()))
-        legend = f"青实线　{self.profile['nickname']}　·　{count_text(ship.get('battles'))} 场"
+        legend = f"{self.profile['nickname']}　·　{count_text(ship.get('battles'))} 场"
         if self.peer:
-            legend += f"　　 粉虚线　{self.peer['nickname']}"
-            if not self.ship_radar.comparison:
-                legend += '　·　该舰资料不足'
+            if self.ship_radar.comparison:
+                legend = f"青实线　{legend}　　 粉虚线　{self.peer['nickname']}"
+            else:
+                legend += f"　　 {self.peer['nickname']}　·　该舰资料不足"
         self.radar_focus.present(self.ship_radar, ship['name'], legend, self.ship_zoom)
 
     def compare(self):
@@ -762,7 +1121,7 @@ class QueryCenterPanel(QWidget):
         from ..query_ratings import player_ratings
         if self.profile and self.card_btn.isEnabled():
             data = player_ratings(self.career,self.profile,achievements=self.profile.get('achievements'))
-            SnapshotCardDialog(self.profile,data,self).exec()
+            SnapshotCardDialog(self.profile, data, self, dog_tag_png=self._active_dog_tag_png).exec()
 
     def _show_clan(self):
         self.stack.setCurrentIndex(2)
@@ -791,7 +1150,7 @@ class QueryCenterPanel(QWidget):
         species, tier = self.clan_class.currentData(),self.clan_tier.currentData()
         stats = clan_ratings(info,self.clan['batch_players'],self.career.references['benchmarks'],
                              member_frames=self.frames,species=species,tier=tier)
-        self.clan_radar.set_scores(stats['scores'])
+        self.clan_radar.set_scores(stats['scores'], overall=stats['overall'])
         members = stats['members']
         self.clan_summary.set_summary(stats, filtered=species is not None or tier is not None,
                                       fleets_loaded=bool(self.frames))

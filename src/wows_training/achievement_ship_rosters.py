@@ -1,0 +1,193 @@
+"""Historical acquisition rosters for Random Battle collection achievements.
+
+All identities are Wargaming encyclopedia ship_id values. The ASIA, EU, and
+NA 15.10.0 encyclopedia records agreed as of 2026-11-25. Temporary rentals,
+test hulls, and early access tech-tree entries can carry premium/special API
+flags, so the flags alone cannot establish public release or acquisition.
+"""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ShipRoster:
+    ship_ids: frozenset[str]
+    complete: bool
+
+
+_SUPPORTED_REGIONS = frozenset({"asia", "eu", "na"})
+
+
+# VIII+ ship-class lists and the separate Special ships index, reconciled with
+# the API categories and releases. The older per-class summary misses, among
+# others, Victoria, Victoria B, Triunfante, Regele Carol I, and Sanzang.
+# https://wiki.worldofwarships.com/Ship:Premium_ships
+# https://wiki.worldofwarships.com/Ship:Special_ships
+# https://wiki.worldofwarships.com/Ship:Battleships
+# https://wiki.worldofwarships.com/Ship:Cruisers
+# https://wiki.worldofwarships.com/Ship:Aircraft_Carriers
+# https://worldofwarships.com/en/news/game-updates/update-1510-horror-from-the-abyss/
+# The historical Premium/Special denominator has not been exhaustively verified.
+_PREMIUM_SPECIAL_IDS = frozenset((
+    # AirCarrier
+    "3353327600 3330258640 3762271984 3762271696 3667899856 3741300688 3751786480 "
+    "3760175088 3751786288 3667900208 3730814960 3332356080 3550459216 3762272208 "
+    "3751786192 3667900112 3760175056 3655317296 3550459856 3741300720 3667900400 "
+    "3762271440 3550459600 3542071248 "
+    # Battleship
+    "3539941072 3330225872 3353294640 3362732016 3552524016 3341760240 3332323312 "
+    "3342808912 3551475152 3762239472 3437180912 3552524272 3741267952 3741267760 "
+    "3560912592 3762238800 3437180656 3436131792 3435083760 3437180720 3761190096 "
+    "3341760496 3552524080 3741267408 3760142160 3751753520 3730782000 3741267792 "
+    "3730782192 3539941104 3729733328 3321837360 3730782032 3332323152 3540989744 "
+    "3762239312 3530504176 3750704880 4179572528 3750704848 3374266064 3729733616 "
+    "3655284688 3540989936 3550426480 3740219088 3708761808 3751753552 3666818896 "
+    "3341759792 3761190192 3750705136 3666819056 3342809072 3762239184 3751753168 "
+    "3729732816 3341759952 3542038256 3761190640 3761190864 3341760464 3751753712 "
+    "3667867632 3655284528 3761190896 3761190608 3761190352 3540989232 3447666672 "
+    "3762239280 3760142320 3720296272 3540989680 3551475440 3761190704 3666818864 "
+    "3552524240 3363780304 3539941360 3319740400 3762239216 3342808816 3551475536 "
+    "3760142064 3656333264 3550426448 3760142032 3550426576 3550426864 3760141776 "
+    "3520017872 3740218576 3551474896 3445569264 3542038512 3760142288 4292818736 "
+    "3667867440 3551475120 3719247568 3542037808 3540989264 3762239440 3540989360 "
+    "3331274160 3319740208 3342808880 3550426896 3529455600 3309254640 3750704336 "
+    "3552523472 3550426832 3540989136 3540989392 "
+    # Cruiser
+    "3540957136 3740186416 3750672080 3709777872 3332289744 3361650480 3542005744 "
+    "3352213296 3760109552 3666786288 3762206032 3550393680 3540956592 3529422672 "
+    "3751720944 3530470832 3542005456 3552491216 4255037136 3667834576 3445536752 "
+    "3760109264 3425613520 3436099280 3436099408 3530470608 3762206544 3741235152 "
+    "3530471216 3539908400 3330193200 3550394192 3552491504 3760108912 3445536112 "
+    "3540957168 3761157968 3762206672 3320755920 3540956880 3530471120 3760109392 "
+    "3552490832 3741235184 3542005552 3341727696 3761157328 3762206480 3445536720 "
+    "3709777360 3540956912 3530471408 3341727728 3655251920 3730749392 3539908592 "
+    "3330193392 3761157488 3550394160 3550393552 3340678352 3762205904 3437147600 "
+    "3655251664 3445536208 3540956624 3761157584 3539908304 3519985392 3540957008 "
+    "3751720752 3667834672 3740185808 3530471152 3750672112 3762206160 4273911760 "
+    "4179539408 3760109296 3676223216 3542004944 3720263632 3762206128 3741234640 "
+    "3550393712 3342775504 3760109520 3539908368 3550394128 3762206512 3330192848 "
+    "3655251952 3340679152 3730748880 3542005040 3730749424 3446585136 3550394352 "
+    "3720263664 3741234992 3342776112 3550393808 3761157936 3655251408 3739137488 "
+    "3760109008 3363747792 3519985360 3509499600 3499013840 3550393648 3529422032 "
+    "3540956368 3751720912 4276008656 3750672368 3761158128 3761157904 3552491280 "
+    "3762206704 3531519792 3751720144 3749623504 3676223184 3361650384 3539907792 "
+    "3750672176 3542005712 "
+    # Destroyer
+    "3361617616 3331208656 3541972688 3550361328 3751687888 3667801808 3540924368 "
+    "3761125360 3551410160 3740153840 3552458032 3540923696 3551409520 3550361424 "
+    "3752736720 3667802064 3531486416 3760076752 3541972944 3751687376 3655219184 "
+    "3760076080 3550361296 3550361392 3539875632 3436066800 3761125136 3750639600 "
+    "3760076496 3541972816 3552458448 3741202128 3539875824 3540924400 3750638896 "
+    "4179506640 3762173936 3445503824 3550360912 3550361584 3762173776 3762173136 "
+    "3667801296 3760075984 3340645584 4074649424 3540924112 3540923600 3551409616 "
+    "3341694416 3762173232 3761125104 3552458512 3541972432 3550360880 3530437840 "
+    "3340646192 3531486928 3541972176 4076745936 3655218480 3760076784 3750639568 "
+    "3362666192 3655218960 3760076144 3761124656 3751687984 3655218992 3750639408 "
+    "3740153648 3551409968 3540924208 3552457936 3760076208 "
+    # Submarine
+    "3761682384 3549870064 3434526416 3759585264 3751196368 3539384016 3549869360 "
+    "3761681872 3549870032 3549869904 3549869840 3759585072"
+).split())
+
+
+# 15.10 vessel roster plus the released Blue Archive submarine omitted by the
+# class index. The pre-0.11.9 German/US test and rental IDs are separate hulls.
+# https://wiki.worldofwarships.com/index.php?title=Ship:Submarines&oldid=44228
+# https://worldofwarships.com/en/news/sales-and-events/blue-archive-2026/
+# https://worldofwarships.com/en/news/sales-and-events/missions-0114/
+# https://worldofwarships.com/en/news/game-guides/submarine-guide/
+_SUBMARINE_IDS = frozenset({
+    "3549869360",  # Orzeł
+    "3549869904",  # Surcouf
+    "4076255024",  # U-190
+    "4074157872",  # U-2501
+    "3759585072",  # U-4501
+    "4181112560",  # Pietro Micca
+    "4179015408",  # Pietro Calvi
+    "3751196368",  # I-56
+    "3539384016",  # I-56 '44
+    "3434526416",  # BA Arona's Whale
+    "3549869840",  # Tonijn
+    "4181112784",  # Sturdy
+    "3761682384",  # Alliance
+    "4179015632",  # Thrasher
+    "3549870032",  # Seal
+    "4076255216",  # Salmon
+    "4074158064",  # Balao
+    "3759585264",  # Gato
+    "3549870064",  # Archerfish
+    "4181112272",  # L-20
+    "3761681872",  # S-189
+    "4179015120",  # K-1
+})
+
+
+# Direct Steel offers and fixed Steel-priced milestones for named ships.
+# The historical offer records have not been exhaustively verified. Event
+# currencies, generic Steel-to-Coal exchange and random drops do not qualify.
+# https://armory.worldofwarships.com/en/category/ships/?filter_category=ships
+# https://worldofwarships.com/en/news/game-updates/update-091-british-cruisers-part2/
+# https://worldofwarships.com/en/news/sales-and-events/premium-shop-087/
+# https://worldofwarships.com/en/news/game-guides/the-steel-hoarders-guide-to-update-1311/
+# https://wiki.worldofwarships.com/Ship:Update_14.11
+# https://worldofwarships.asia/en/news/sales-and-events/salvage-for-victory-1211-kitakami/
+_STEEL_IDS = frozenset({
+    # Live Armory 15.10
+    "3529422032",  # Taejong
+    "3550393712",  # Pioneer
+    "3529422672",  # Amiral Lartigue
+    "3760175088",  # Franklin D. Roosevelt
+    "3760142032",  # Shikishima
+    "3550426896",  # Willem de Eerste
+    "3760142064",  # Ruggiero di Lauria
+    "3655284528",  # Mecklenburg
+    "3655284688",  # Incomparable
+    "3550361328",  # Alberico da Barbiano
+    "3550459600",  # Shinano
+    "3549870064",  # Archerfish
+    "3550393648",  # Svea
+    "3445536208",  # Komissar
+    "3760142160",  # Bourgogne
+    "3445536752",  # Austin
+    "3759585264",  # Gato
+    "3760109008",  # Stalingrad
+    "3655218992",  # Z-42
+    "3550360880",  # Ragnar
+    "3760109520",  # Plymouth
+    "3761158128",  # Vallejo
+    # Retired direct offers
+    "3553540080",  # Flint
+    "3551410160",  # Black
+    "3551409616",  # Neustrashimy
+    "3760076784",  # Somers
+    # Steel Will in 13.11
+    "3550361392",  # Georg Hoffmann
+    "3550394128",  # Prins van Oranje
+    "3540956880",  # Chikuma II
+    # Steel Fleet in 14.11
+    "3540989264",  # Valparaíso
+    "3539384016",  # I-56 '44
+    "3540957008",  # Le Havre
+    "3539908592",  # Hawaii
+    "3539908400",  # Bremen
+    "3539941072",  # Aki
+    # Fixed Steel milestones in Salvage for Victory in 12.11
+    "3764303152",  # Elli (13,600 Steel cumulative)
+    "3752769264",  # Francesco Ferruccio (27,200 Steel cumulative)
+    "3445536720",  # Defence (68,000 Steel cumulative)
+    "3655251664",  # Kitakami (136,000 Steel cumulative)
+})
+
+_ROSTERS = {
+    "premium_special": ShipRoster(_PREMIUM_SPECIAL_IDS, complete=False),
+    "submarine": ShipRoster(_SUBMARINE_IDS, complete=True),
+    "steel": ShipRoster(_STEEL_IDS, complete=False),
+}
+_EMPTY_ROSTER = ShipRoster(frozenset(), complete=False)
+
+
+def historical_ship_roster(kind: str, region: str) -> ShipRoster:
+    """Return release-verified IDs and whether they cover the entire roster."""
+    if region not in _SUPPORTED_REGIONS:
+        return _EMPTY_ROSTER
+    return _ROSTERS[kind]

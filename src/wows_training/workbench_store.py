@@ -56,6 +56,9 @@ class WorkbenchStore:
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
                     sequence INTEGER NOT NULL, decision TEXT NOT NULL, comment TEXT NOT NULL,
                     created_at TEXT NOT NULL, UNIQUE(run_id,sequence));
+                CREATE TABLE IF NOT EXISTS dog_tags(
+                    region TEXT NOT NULL, account_id TEXT NOT NULL, png BLOB NOT NULL,
+                    PRIMARY KEY(region,account_id));
                 PRAGMA user_version=1;
             """)
 

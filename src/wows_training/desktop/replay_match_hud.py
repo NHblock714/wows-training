@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
+from PySide6.QtCore import QEasingCurve, QPointF, QRectF, QSize, Qt, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from . import academy_palette as tone
 from .layered_panel import panel_path
+from .motion import motion_enabled, subscribe_motion
 
 
 UNKNOWN = '#8096A9'
@@ -136,6 +137,15 @@ class ReplayTeamRail(_HudSurface):
         self.selected: int | None = None
         self._hovered: int | None = None
         self._keyboard_entity: int | None = None
+        self.setProperty('backgroundEffect', True)
+        self._background_enabled = True
+        self._reveal = 1.
+        self._row_motion = QVariantAnimation(self)
+        self._row_motion.setStartValue(0.)
+        self._row_motion.setEndValue(1.)
+        self._row_motion.setDuration(210)
+        self._row_motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._row_motion.valueChanged.connect(self._set_reveal)
         self._ships: list[tuple[QRectF, int]] = []
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.setMinimumWidth(88)
@@ -145,6 +155,28 @@ class ReplayTeamRail(_HudSurface):
 
     def sizeHint(self):
         return QSize(114, 340)
+
+    def _set_reveal(self, value):
+        self._reveal = float(value)
+        self.update()
+
+    def _settle_row(self):
+        self._row_motion.stop()
+        self._set_reveal(1.)
+
+    def _motion_changed(self, enabled):
+        if not enabled:
+            self._settle_row()
+
+    def set_background_enabled(self, enabled):
+        self._background_enabled = bool(enabled)
+        if not enabled:
+            self._settle_row()
+        self.update()
+
+    def showEvent(self, event):
+        subscribe_motion(self, self._motion_changed)
+        super().showEvent(event)
 
     def set_team(self, team):
         if self.team == team:
@@ -182,9 +214,67 @@ class ReplayTeamRail(_HudSurface):
         finally:
             painter.end()
 
+    def _paint_score_plate(self, painter, rect, accent):
+        # Shallow enamel inset around the score; the ship list uses the full rail width.
+        plate = QRectF(rect.left(), rect.top(), rect.width(), 45)
+        outline = panel_path(plate, 6)
+        stock = QLinearGradient(plate.topLeft(), plate.bottomRight())
+        stock.setColorAt(0, QColor('#F8FBFE'))
+        stock.setColorAt(.55, QColor('#F7EDF2' if self.right else '#E6F0F6'))
+        stock.setColorAt(1, QColor('#E8DDE7' if self.right else '#D0E0EB'))
+        painter.fillPath(outline, stock)
+        painter.save()
+        painter.setClipPath(outline, Qt.ClipOperation.IntersectClip)
+        accent = QColor(accent)
+        for edge, sign in ((plate.left(), 1), (plate.right(), -1)):
+            painter.save()
+            painter.translate(edge, plate.top())
+            painter.scale(sign, 1)
+            tint = QColor(accent)
+            tint.setAlpha(26)
+            shoulder = QPainterPath(QPointF(0, 0))
+            shoulder.lineTo(12, 0)
+            shoulder.lineTo(4, 12)
+            shoulder.lineTo(4, 30)
+            shoulder.lineTo(0, 35)
+            shoulder.closeSubpath()
+            painter.fillPath(shoulder, tint)
+            tint.setAlpha(105)
+            painter.setPen(QPen(tint, .8))
+            for y in (14, 18, 22):
+                painter.drawLine(QPointF(0, y + 2), QPointF(4, y - 2))
+            painter.restore()
+        painter.restore()
+
+    def _paint_active_row(self, painter, row, selected, hovered):
+        outline = panel_path(row, 5)
+        accent = QColor('#B45580' if self.right else '#377CA7')
+        base = QColor('#F2E0EA' if self.right else '#DDECF7')
+        if self._background_enabled:
+            start = row.topLeft() if self.right else row.topRight()
+            end = row.topRight() if self.right else row.topLeft()
+            face = QLinearGradient(start, end)
+            face.setColorAt(0, QColor('#E4C8D9' if self.right else '#B9D9EA'))
+            face.setColorAt(.45, base)
+            face.setColorAt(1, QColor('#F8F4F8' if self.right else '#F2F7FC'))
+            painter.fillPath(outline, face)
+        else:
+            painter.fillPath(outline, base)
+        if selected:
+            painter.setPen(QPen(accent, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(outline)
+        # The underline enters from the ship glyph, leaving the text at rest.
+        travel = self._reveal if hovered else 1.
+        width = min(26., row.width() * .32) * travel
+        start = row.left() + 5 if self.right else row.right() - 5 - width
+        painter.fillRect(QRectF(start, row.bottom() - 2, width, 1.8), accent)
+
     def _paint_team(self, painter, rect, team):
         score = str(team.score) if team.score is not None else '—'
         color = _team_ink(team.color)
+        if self._background_enabled:
+            self._paint_score_plate(painter, rect, color)
         self._text(painter, QRectF(rect.x(), rect.y(), rect.width(), 30),
                    score, color if team.score is not None else tone.INK, 24, True)
         self._text(painter, QRectF(rect.x(), rect.y()+30, rect.width(), 16), team.label, tone.INK, 12, True)
@@ -210,13 +300,10 @@ class ReplayTeamRail(_HudSurface):
             return
         for index, ship in enumerate(team.ships):
             row = QRectF(rect.x(), rect.y()+72+index*pitch, rect.width(), pitch-1)
-            if ship.entity == self.selected:
-                row_path = panel_path(row, 5)
-                painter.fillPath(row_path, QColor('#D5E8FB' if not self.right else '#EFDAEC'))
-                painter.setPen(QPen(QColor(tone.BLUE if not self.right else '#BC5A86'), 1))
-                painter.drawPath(row_path)
-            elif ship.entity == self._hovered:
-                painter.fillPath(panel_path(row, 5), QColor('#DFF1FC' if not self.right else '#F5E0F0'))
+            selected = ship.entity == self.selected
+            hovered = ship.entity == self._hovered
+            if selected or hovered:
+                self._paint_active_row(painter, row, selected, hovered)
             elif index % 2 == 0:
                 painter.fillRect(row, QColor('#E2EBF6' if not self.right else '#EBE5F2'))
             if self.hasFocus() and ship.entity == self._keyboard_entity:
@@ -260,6 +347,12 @@ class ReplayTeamRail(_HudSurface):
         if self._hovered == entity:
             return
         self._hovered = entity
+        self._row_motion.stop()
+        if entity is not None and self._background_enabled and self.isVisible() and motion_enabled(self):
+            self._set_reveal(0.)
+            self._row_motion.start()
+        else:
+            self._set_reveal(1.)
         self.setCursor(Qt.CursorShape.PointingHandCursor if entity is not None else Qt.CursorShape.ArrowCursor)
         self.ship_hovered.emit(entity)
         self.update()

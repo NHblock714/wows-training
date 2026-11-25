@@ -1,12 +1,13 @@
 """Archive-paper ornament limited to genuinely unused view space."""
 import math
 
-from PySide6.QtCore import QEvent,QObject,QRect,Qt,QTimer
-from PySide6.QtGui import QColor,QLinearGradient,QPainter,QPainterPath,QPalette,QPen
+from PySide6.QtCore import QEvent,QObject,QPointF,QRect,QRectF,Qt,QTimer
+from PySide6.QtGui import QColor,QLinearGradient,QPainter,QPainterPath,QPalette,QPen,QPolygonF
 from PySide6.QtWidgets import QListView,QListWidget,QTableWidget,QTextBrowser,QWidget
 from shiboken6 import isValid
 
 from . import academy_palette as colors
+from .item_hover import ItemHover
 from .motion import motion_enabled,subscribe_motion
 
 
@@ -17,7 +18,9 @@ class _ArchiveCanvas(QWidget):
         self.phase=0.
         self._queued=False
         self._dark=False
+        self._background_enabled=getattr(view.window(),'client_preferences',{}).get('background_enabled',True)
         self.setObjectName('archiveBlankCanvas')
+        self.setProperty('backgroundEffect',True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -38,6 +41,13 @@ class _ArchiveCanvas(QWidget):
             if isinstance(view,QTableWidget):
                 view.verticalHeader().sectionResized.connect(self.schedule)
                 view.verticalHeader().sectionMoved.connect(self.schedule)
+        self.schedule()
+
+    def set_background_enabled(self,enabled):
+        self._background_enabled=bool(enabled)
+        if not self._background_enabled:
+            self.phase=0.
+            self.hide()
         self.schedule()
 
     def schedule(self,*_):
@@ -73,7 +83,7 @@ class _ArchiveCanvas(QWidget):
         viewport=self.view.viewport()
         start=max(0,self._data_bottom())
         remaining=viewport.height()-start
-        wanted=self.view.isVisible() and remaining>=90 and viewport.width()>=170
+        wanted=self._background_enabled and self.view.isVisible() and remaining>=90 and viewport.width()>=170
         self.setGeometry(QRect(0,start,viewport.width(),max(0,remaining)))
         base=self.view.palette().color(QPalette.ColorRole.Base)
         self._dark=base.lightnessF()<.45
@@ -88,16 +98,46 @@ class _ArchiveCanvas(QWidget):
             # Only reconcile a changed boundary, so normal paints cannot create a repaint loop.
             start=max(0,self._data_bottom())
             remaining=watched.height()-start
-            wanted=self.view.isVisible() and remaining>=90 and watched.width()>=170
+            wanted=self._background_enabled and self.view.isVisible() and remaining>=90 and watched.width()>=170
             if self.y()!=start or self.height()!=max(0,remaining) or self.isVisible()!=wanted:
                 self.refresh()
         elif watched is self.view and event.type() in (QEvent.Type.Hide,QEvent.Type.Close):
             self.hide()
         return False
 
+    def _paint_material(self,p,w,h):
+        wash=QLinearGradient(QPointF(w*.08,0),QPointF(w*.75,h))
+        wash.setColorAt(0,QColor(105,163,222,0))
+        wash.setColorAt(.55,QColor(105,163,222,13 if self._dark else 16))
+        wash.setColorAt(1,QColor(221,111,175,12 if self._dark else 19))
+        p.fillRect(QRectF(0,0,w,h),wash)
+
+        # Keep the darker layers against the edges of empty space.
+        shelf=h*.57
+        rail=w*.38
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(113,177,233,14 if self._dark else 22))
+        p.drawPolygon(QPolygonF([QPointF(0,h),QPointF(0,shelf),QPointF(rail*.62,shelf),
+                                 QPointF(rail,h)]))
+        p.setBrush(QColor(149,158,228,12 if self._dark else 19))
+        p.drawPolygon(QPolygonF([QPointF(rail*.45,h),QPointF(w*.67,h*.40),
+                                 QPointF(w*.88,h*.40),QPointF(w*.59,h)]))
+        if h<130 or w<250:
+            return
+        marks=QPainterPath()
+        marks.addPolygon(QPolygonF([QPointF(14,h-11),QPointF(14,h-56),
+                                   QPointF(rail*.59,h-56),QPointF(rail*.75,h-11)]))
+        p.save()
+        p.setClipPath(marks,Qt.ClipOperation.IntersectClip)
+        p.setPen(QPen(QColor(113,165,216,24 if self._dark else 34),1))
+        for x in range(-42,int(rail*.75)+42,7):
+            p.drawLine(QPointF(x,h-10),QPointF(x+46,h-56))
+        p.restore()
+
     def paintEvent(self,event):
         p=QPainter(self);p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w,h=self.width(),self.height()
+        self._paint_material(p,w,h)
         ink=QColor('#B9D3EA' if self._dark else '#203D5C')
         accent=QColor(colors.PINK)
         # A partly open folder and two offset page leaves fill the free area without words.
@@ -132,9 +172,14 @@ class _ArchiveCanvas(QWidget):
             accent.setAlpha(28);p.setPen(QPen(accent,2));p.drawLine(24,int(h*.25),24,int(h*.25)+19)
         # A faint scan segment travels only within the ornament, using the host's ambient tick.
         if motion_enabled(self.view) and self.phase:
-            dy=40+(self.phase%8)/8*max(1,folder_h-55)
-            glow=QColor(colors.CYAN);glow.setAlpha(25 if self._dark else 19)
-            p.setPen(QPen(glow,2));p.drawLine(int(x+25),int(y+dy),int(x+folder_w-28),int(y+dy))
+            progress=(self.phase%10)/10
+            dy=40+progress*max(1,folder_h-55)
+            strength=math.sin(math.pi*progress)
+            glow=QLinearGradient(x+25,0,x+folder_w-28,0)
+            glow.setColorAt(0,QColor(81,175,222,0))
+            glow.setColorAt(.64,QColor(81,175,222,round((42 if self._dark else 35)*strength)))
+            glow.setColorAt(1,QColor(232,102,170,0))
+            p.fillRect(QRectF(x+25,y+dy-2,max(0,folder_w-53),4),glow)
         p.end()
 
 
@@ -168,13 +213,16 @@ class _ArchiveCanvases(QObject):
             parent=view
             excluded=False
             while parent is not None and parent is not self.window:
-                if parent.objectName()=='replayPanel':excluded=True;break
+                if parent.objectName() in ('replayPanel','sidebar') or parent.property('tacticalSurface') is True:
+                    excluded=True;break
                 parent=parent.parentWidget()
             if excluded:continue
             previous=getattr(view,'_empty_table_art',None)
             if previous is not None:
                 previous.hide();previous.deleteLater();view._empty_table_art=None
             canvas=_ArchiveCanvas(view);self.canvases.append(canvas)
+            if isinstance(view,(QTableWidget,QListWidget)) and not getattr(view,'_archive_item_hover',None):
+                view._archive_item_hover=ItemHover(view)
             found.add(view)
 
     def _motion_changed(self,enabled):

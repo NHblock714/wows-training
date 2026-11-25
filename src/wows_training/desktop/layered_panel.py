@@ -1,4 +1,6 @@
 """Folded display surfaces with painted depth and bounded hover illumination."""
+from functools import lru_cache
+
 from PySide6.QtCore import QEasingCurve, QEvent, QPointF, QRectF, Qt, QVariantAnimation
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
@@ -37,7 +39,79 @@ def panel_path(rect, cut=18):
     return path
 
 
-def paint_layered_panel(painter, rect, *, dark=False, accent=colors.BLUE, progress=0., cut=18):
+@lru_cache(maxsize=1)
+def _etched_inlay():
+    """Fixed-size engraving in logical pixels, measured from the trailing corner."""
+    foil = QPainterPath(QPointF(-212, 0))
+    foil.lineTo(-184, -28)
+    foil.lineTo(-127, -28)
+    foil.lineTo(-91, -64)
+    foil.lineTo(-34, -64)
+    foil.lineTo(0, -98)
+    foil.lineTo(0, 0)
+    foil.closeSubpath()
+    tracks = QPainterPath()
+    for offset in (0, 4):
+        tracks.moveTo(-174 + offset, -22 + offset)
+        tracks.lineTo(-124 + offset, -22 + offset)
+        tracks.lineTo(-88 + offset, -58 + offset)
+        tracks.lineTo(-31 + offset, -58 + offset)
+    outer_rail = QPainterPath(QPointF(-201, -14))
+    outer_rail.lineTo(-171, -14)
+    outer_rail.lineTo(-163, -22)
+    outer_rail.lineTo(-117, -22)
+    outer_rail.lineTo(-107, -32)
+    outer_rail.lineTo(-96, -32)
+    perforations = QPainterPath()
+    for row in range(4):
+        for column in range(13 - row):
+            x = -91 + column * 6 + row * 3
+            y = -18 - row * 5
+            perforations.addEllipse(QRectF(x, y, 1.45, 1.45))
+    return foil, tracks, outer_rail, perforations
+
+
+def _paint_inlay(painter, rect, dark, accent, progress):
+    foil, tracks, outer_rail, perforations = _etched_inlay()
+    scale = min(1., rect.width() / 282., rect.height() / 112.)
+    painter.save()
+    painter.translate(rect.bottomRight())
+    painter.scale(scale, scale)
+    satin = QLinearGradient(-154, -52, -12, 16)
+    tint = QColor('#8EBADD' if dark else '#426F9D')
+    for stop, alpha in ((0, 3), (.46, 12), (.58, 4), (1, 20)):
+        tint.setAlpha(alpha)
+        satin.setColorAt(stop, tint)
+    painter.fillPath(foil, satin)
+    tint.setAlpha(38 if dark else 34)
+    painter.setPen(QPen(tint, .8))
+    painter.drawPath(tracks)
+    edge = QColor(accent)
+    edge.setAlpha(35 if dark else 29)
+    painter.setPen(QPen(edge, .9))
+    painter.drawPath(outer_rail)
+    painter.drawEllipse(QPointF(-96, -32), 2.1, 2.1)
+    tint.setAlpha(57 if dark else 47)
+    painter.fillPath(perforations, tint)
+    if progress:
+        # Reserve the bright glint for the bottom gutter below right-aligned values.
+        lead = -191 + 132 * progress
+        glint = QLinearGradient(lead - 30, 0, lead + 30, 0)
+        light = QColor(colors.CYAN if dark else accent)
+        light.setAlpha(0)
+        glint.setColorAt(0, light)
+        glint.setColorAt(1, light)
+        light.setAlpha(round(progress * 170))
+        glint.setColorAt(.5, light)
+        painter.setPen(QPen(glint, 1.35))
+        painter.drawLine(QPointF(-201, -5), QPointF(-17, -5))
+        painter.setPen(QPen(glint, .9))
+        painter.drawPath(outer_rail)
+    painter.restore()
+
+
+def paint_layered_panel(painter, rect, *, dark=False, accent=colors.BLUE, progress=0., cut=18,
+                        material=False):
     """Paint beneath layout contents. Five pixels along the bottom/right hold the backing."""
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -65,6 +139,9 @@ def paint_layered_panel(painter, rect, *, dark=False, accent=colors.BLUE, progre
     sheen.setColorAt(.37, QColor(255, 255, 255, 5))
     sheen.setColorAt(1, QColor(240, 87, 166, 8 + round(progress * 15)))
     painter.fillRect(rect, sheen)
+    detailed = material and rect.width() >= 176 and rect.height() >= 64
+    if detailed:
+        _paint_inlay(painter, rect, dark, accent, progress)
     # Offset drafting lines and an exposed dark corner give the white surface depth.
     strip = QPainterPath()
     extent = _fold_extent(cut, rect.height())
@@ -72,7 +149,25 @@ def paint_layered_panel(painter, rect, *, dark=False, accent=colors.BLUE, progre
     strip.lineTo(rect.right(), rect.top())
     strip.lineTo(rect.right(), rect.top() + extent)
     strip.closeSubpath()
-    painter.fillPath(strip, QColor(colors.NIGHT))
+    if detailed:
+        bevel = QLinearGradient(rect.topRight() - QPointF(extent, 0),
+                                rect.topRight() + QPointF(0, extent))
+        bevel.setColorAt(0., QColor("#263C55"))
+        bevel.setColorAt(.40, QColor(colors.NIGHT))
+        bevel.setColorAt(.74, QColor("#233A55"))
+        bevel.setColorAt(1., QColor("#142439"))
+        painter.fillPath(strip, bevel)
+        painter.save()
+        painter.setClipPath(strip, Qt.ClipOperation.IntersectClip)
+        sheen_ink = QColor(144, 197, 226, 43 + round(29 * progress))
+        for inset in (8., 12., 17.):
+            painter.setPen(QPen(sheen_ink, .85 if inset == 12. else .6))
+            start = rect.topRight() - QPointF(extent - inset, 0)
+            end = rect.topRight() + QPointF(0, extent - inset)
+            painter.drawLine(start + (end - start) * .14, end - (end - start) * .14)
+        painter.restore()
+    else:
+        painter.fillPath(strip, QColor(colors.NIGHT))
     painter.setPen(QPen(QColor(colors.PINK), 2))
     # A short illuminated segment travels along the bevel during the normal
     # hover transition. Its entire stroke stays on the exposed corner strip.
@@ -114,6 +209,8 @@ class LayeredPanel(QWidget):
         super().__init__(parent)
         self.setObjectName('layeredPanel')
         self.dark, self.accent, self.cut = dark, accent, cut
+        self.setProperty('backgroundEffect', True)
+        self._background_enabled = True
         self.hover_progress = 0.
         self._bound = False
         self._observed_window = None
@@ -134,6 +231,11 @@ class LayeredPanel(QWidget):
     def _preference(self, enabled):
         if not enabled:
             self._finish()
+
+    def set_background_enabled(self, enabled):
+        if self._background_enabled != bool(enabled):
+            self._background_enabled = bool(enabled)
+            self.update()
 
     def _aim(self, inside):
         self._hover.stop()
@@ -158,6 +260,8 @@ class LayeredPanel(QWidget):
         if not self._bound:
             self._bound = subscribe_motion(self, self._preference)
         window = self.window()
+        settings = getattr(window, 'client_preferences', {})
+        self._background_enabled = settings.get('background_enabled', self._background_enabled)
         if self._observed_window is not window:
             if self._observed_window is not None:
                 self._observed_window.removeEventFilter(self)
@@ -177,7 +281,7 @@ class LayeredPanel(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         paint_layered_panel(painter, self.rect(), dark=self.dark, accent=self.accent,
-                            progress=self.hover_progress, cut=self.cut)
+                            progress=self.hover_progress, cut=self.cut, material=self._background_enabled)
         painter.end()
 
 

@@ -364,6 +364,9 @@ class _ButtonFeedback(_Overlay):
             self._paint_stripes(painter, box, .26 + .62 * hover, .34 * hover)
         elif active and button.isCheckable() and button.text() and self.selection > .001:
             self._paint_stripes(painter, box, self.selection, self.controller.selection_phase)
+        material = getattr(self.controller.window, 'client_preferences', {}).get('background_enabled', True)
+        if material and active and not self.card and name not in ('homeImport', 'nav', 'soundToggle'):
+            self._paint_folded_end(painter, box, option, hover, dark)
         if hover > .001:
             self._paint_corner_traces(painter, box, cut, hover, dark)
         if self.pulse < 1.0 and active:
@@ -414,6 +417,95 @@ class _ButtonFeedback(_Overlay):
         painter.drawLine(box.topLeft()+QPointF(10,1.2),box.topRight()-QPointF(16,-1.2))
         painter.setPen(QPen(QColor(87,171,215,round(70+70*hover) if active else 25),1.3))
         painter.drawLine(box.bottomLeft()+QPointF(13,-1.5),box.bottomLeft()+QPointF(29,-1.5))
+
+    def _paint_folded_end(self, painter, box, option, hover, dark):
+        """Fit a folded laminate into the spare space alongside the native label."""
+        if not option.text or box.height() < 18:
+            return
+        label = option.fontMetrics.size(Qt.TextFlag.TextShowMnemonic, option.text).width()
+        if not option.icon.isNull():
+            label += option.iconSize.width() + 4
+        margin = 4.
+        if option.features & QStyleOptionButton.ButtonFeature.HasMenu:
+            button = self.parentWidget()
+            margin += button.style().pixelMetric(QStyle.PixelMetric.PM_MenuButtonIndicator, option, button)
+        room = min(144., box.width() * .35, (box.width() - label) / 2 - margin - 7.)
+        if room < 19.:
+            return
+
+        painter.save()
+        if option.direction == Qt.LayoutDirection.RightToLeft:
+            painter.translate(box.left() + margin, box.top())
+            painter.scale(-1., 1.)
+        else:
+            painter.translate(box.right() - margin, box.top())
+        height = box.height()
+        # The hinge opens from the outside in. Both faces stay clear of the text
+        # at their maximum extension, including during a reversed hover.
+        span = room * (.78 + .22 * hover)
+        lean = min(span * .57, height * .82)
+        top = QPointF(-span + lean, 0)
+        foot = QPointF(-span, height)
+        face = QLinearGradient(foot, QPointF(0, height))
+        face.setColorAt(0., QColor(97, 194, 244, round(35 + 40 * hover)))
+        face.setColorAt(.62, QColor(32, 114, 185, round(24 + 22 * hover)))
+        face.setColorAt(1., QColor(105, 170, 220, 6))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(face)
+        painter.drawPolygon(QPolygonF([top, QPointF(0, 0), QPointF(0, height), foot]))
+        fold = QPointF(-span * .32, height)
+        painter.setBrush(QColor(216, 237, 255, round((14 if dark else 46) + 24 * hover)))
+        painter.drawPolygon(QPolygonF([top, fold, foot]))
+        seam = QColor('#9BEAF7' if dark else '#397EB2')
+        seam.setAlpha(round(63 + 62 * hover))
+        painter.setPen(QPen(seam, .85))
+        painter.drawLine(top, foot)
+        if span >= 32.:
+            # A recessed second seam separates the transparent leaf from its bevel.
+            along = top - foot
+            inset = QPointF(4., 0.)
+            reflection = QColor('#DBF1FB' if dark else '#FFFFFF')
+            reflection.setAlpha(round(42 + 66 * hover))
+            painter.setPen(QPen(reflection, .85))
+            painter.drawLine(foot + along * .17 + inset, foot + along * .87 + inset)
+            plate_end = QPointF(-3., height * .26)
+            keyline = QPainterPath(top + QPointF(7., 3.))
+            keyline.lineTo(plate_end + QPointF(-8., 0.))
+            keyline.lineTo(plate_end)
+            painter.setPen(QPen(seam, .65))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(keyline)
+        gleam = math.sin(math.pi * hover)
+        if gleam > .01:
+            along = top - foot
+            start = foot + along * max(0., hover - .18)
+            tip = foot + along * hover
+            painter.setPen(QPen(QColor(245, 253, 255, round(215 * gleam)), 1.4))
+            painter.drawLine(start, tip)
+
+        if room >= 54.:
+            outer = -box.width() + margin + 12.
+            y = height * .54
+            end = outer + room * (.26 + .16 * hover)
+            trace = QPainterPath(QPointF(outer, y + 3.))
+            trace.lineTo(end - 4., y + 3.)
+            trace.lineTo(end, y - 1.)
+            trace.lineTo(end + 7., y - 1.)
+            painter.setPen(QPen(seam, .8))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(trace)
+            painter.fillRect(QRectF(end + 9., y - 2., 2., 2.), seam)
+
+        # Short etched marks follow the lower edge of the sheet. The last
+        # magenta mark catches the light as the adjacent hinge unfolds.
+        count = min(9, int(span / 7))
+        for index in range(count):
+            x = -5. - index * 5.
+            ink = QColor(palette.PINK) if index == 0 else QColor(seam)
+            ink.setAlpha(round((118 if index == 0 else 66) + 62 * hover))
+            painter.setPen(QPen(ink, 1.25))
+            painter.drawLine(QPointF(x - 2., height - 4.), QPointF(x, height - 7.))
+        painter.restore()
 
     @staticmethod
     def _paint_corner_traces(painter, box, cut, hover, dark):
@@ -489,6 +581,11 @@ class _ButtonFeedback(_Overlay):
             painter.setPen(QPen(glow,1.8))
             painter.drawLine(QPointF(tail,y),QPointF(head,y))
             painter.fillRect(QRectF(head-1.1,y-1.1,2.2,2.2),colour)
+            if trail >= 9.:
+                # The companion trace dissipates inside the rim as the brighter point advances.
+                inset_y = y - 1.6 * direction
+                painter.setPen(QPen(glow, .75))
+                painter.drawLine(QPointF(tail, inset_y), QPointF(head - direction * 5., inset_y))
 
     @staticmethod
     def _paint_stripes(painter, box, strength, phase):

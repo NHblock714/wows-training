@@ -16,7 +16,7 @@ Windows 上的《World of Warships》录像复盘与战绩查询工具。导入 
 
 ## 从源代码构建
 
-在 Windows 上使用 Python 3.13，安装 `requirements-desktop.txt` 中的依赖。v0.34.2 源码使用 v0.34.1 的 `win64-distribution.zip` 还原运行资源。用发布页给出的归档 SHA-256 校验，再启动源码或使用 PyInstaller 打包。
+在 Windows 上使用 Python 3.13，安装 `requirements-desktop.txt` 中的依赖。v0.34.3 源码使用 v0.34.2 的 `win64-distribution.zip` 还原运行资源。用发布页给出的归档 SHA-256 校验，再启动源码或使用 PyInstaller 打包。
 
 ```powershell
 py -3.13 -m venv .venv

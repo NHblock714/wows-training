@@ -1,29 +1,42 @@
 """Public-account achievements presented as a filterable naval medal gallery."""
 from __future__ import annotations
 
-from html import escape
 import math
 
-from PySide6.QtCore import QPointF, QRectF, QSignalBlocker, Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen, QPolygonF
+from PySide6.QtCore import QEvent, QEasingCurve, QPointF, QRectF, QSignalBlocker, Qt, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QHoverEvent, QLinearGradient, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSpacerItem, QVBoxLayout, QWidget,
+    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QSpacerItem, QVBoxLayout, QWidget,
 )
 
+from ..f1_ratings.challenges import CHALLENGES
 from . import academy_palette as tone
+from .achievement_banner_seal import paint_gallery_seal
+from .achievement_expanded_art import expanded_art_width, paint_expanded_achievement
+from .achievement_rarity import rarity_style
+from .achievement_texture import paint_achievement_texture
+from .achievement_wordmark import RarityWordmark
 from .chart_motion import ChartReveal
 from .harbor_showcase import HarborShowcase
 from .layered_panel import LayeredPanel, panel_path
-from .presentation_fonts import load_presentation_fonts
+from .motion import motion_enabled
+from .presentation_fonts import chinese_sans_families, load_presentation_fonts
 
 
 GROUPS = {
-    "record": ("单场纪录", "#E0AF65"),
-    "mastery": ("舰船专精", "#55C9DF"),
-    "career": ("生涯积累", "#81A9FB"),
-    "fleet": ("舰队构成", "#A7A0E2"),
-    "collection": ("联动与收藏", "#F591C4"),
-    "battle": ("战斗勋章", "#E0AF65"),
+    "record": "单场纪录",
+    "mastery": "战舰专精",
+    "career": "生涯积累",
+    "fleet": "舰队构成",
+    "collection": "战舰收藏",
+    "battle": "战斗成就",
+}
+
+# Tuple-only snapshots written before these catalogue renames carry no IDs.
+_HISTORICAL_NAMES = {
+    "亡牌飞行员": "battle_planes",
+    "观察模式": "battle_scouting",
+    "碰碰船": "ramming",
 }
 
 # Engravings are drawn in medal-radius units so that the shield and ribbon
@@ -47,7 +60,8 @@ def _label(text="", *, pixels=None, family=None, color=tone.INK, bold=False):
     if pixels:
         style += f"font-size:{pixels}px;"
     if family:
-        style += f'font-family:"{family}";'
+        families = (family,) if isinstance(family, str) else family
+        style += "font-family:" + ",".join(f'"{name}"' for name in families) + ";"
     if bold:
         style += "font-weight:600;"
     label.setStyleSheet(style)
@@ -55,7 +69,32 @@ def _label(text="", *, pixels=None, family=None, color=tone.INK, bold=False):
 
 
 def _group_label(group):
-    return GROUPS.get(group, (group, tone.BLUE))[0]
+    return GROUPS.get(group, group)
+
+
+def earned_achievements(detail):
+    """Return selectable earned records from current or legacy account detail."""
+    rows = detail.get("achievement_gallery")
+    if rows is None:
+        rows = ({"name": row[0], "requirement": row[1], "description": row[2] if len(row) > 2 else "",
+                 "status": "earned"} for row in detail.get("challenges", ()) if len(row) >= 2)
+    by_id = {challenge.id: challenge for challenge in CHALLENGES}
+    by_name = {challenge.name: challenge for challenge in CHALLENGES}
+    earned = []
+    for row in rows:
+        if row.get("status") != "earned" or not row.get("name"):
+            continue
+        name = row["name"]
+        source_id = row.get("id") or _HISTORICAL_NAMES.get(name)
+        challenge = by_id.get(source_id) if source_id else by_name.get(name)
+        earned.append({
+            **row,
+            "id": row.get("id") or (challenge.id if challenge else name),
+            "name": challenge.name if challenge else name,
+            "group": row.get("group") or (challenge.group if challenge else "战绩"),
+            "rarity": rarity_style(challenge.rarity if challenge else row.get("rarity")).label,
+        })
+    return earned
 
 
 def _measure(entry):
@@ -66,10 +105,12 @@ def _measure(entry):
     shown = f"{value:,.2f}".rstrip("0").rstrip(".")
     if entry.get("is_lower_bound"):
         shown = "≥ " + shown
+    elif entry.get("is_upper_bound"):
+        shown = "≤ " + shown
     return shown + unit
 
 
-def _medal(painter, center, radius, color, *, earned=False, group=None):
+def paint_medal(painter, center, radius, color, *, earned=False, group=None):
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     ribbon = QPolygonF([center + QPointF(x * radius, y * radius)
@@ -116,10 +157,10 @@ class _Banner(LayeredPanel):
         row.setContentsMargins(24, 16, 16, 18)
         labels = QVBoxLayout()
         labels.setSpacing(2)
+        labels.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         labels.addWidget(_label("成就展厅", pixels=26, family=fonts["chinese_tech"], color="#F1F8FF"))
         self.count = _label(pixels=20, family=fonts["chinese_body"], color="#A4E9F6")
         labels.addWidget(self.count)
-        labels.addWidget(_label("随机战账号成就", color="#CFDEEB"))
         row.addLayout(labels, 1)
         self._seal_space = QSpacerItem(150, 0)
         row.addSpacerItem(self._seal_space)
@@ -185,14 +226,16 @@ class _Banner(LayeredPanel):
             axis = QPointF(math.cos(angle), math.sin(angle))
             painter.setPen(QPen(QColor(121, 192, 234, 163), 1))
             painter.drawLine(center + axis * 61, center + axis * (66 if index % 4 == 0 else 63))
-        _medal(painter, center, 30, QColor("#E3B864" if self.earned else "#8BA3BC"), earned=bool(self.earned))
+        paint_gallery_seal(painter, center, bool(self.earned), self._reveal.progress)
         painter.end()
 
 
 class _MedalIcon(QWidget):
-    def __init__(self, color, group):
+    def __init__(self, style, group):
         super().__init__()
-        self.color = color
+        self.color = QColor(style.accent)
+        self.rank = style.rank
+        self.progress = 0.
         self.group = group
         self.setFixedSize(54, 54)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -209,105 +252,382 @@ class _MedalIcon(QWidget):
         painter.setPen(QPen(QColor("#B5C8D8"), 1))
         painter.drawEllipse(mount)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(self.color, 1.5))
-        for angle in (35, 215):
-            painter.drawArc(mount.adjusted(3, 3, -3, -3), angle * 16, 76 * 16)
-        _medal(painter, mount.center() - QPointF(0, 2), 17, self.color, earned=True, group=self.group)
+        # Opposing index marks open into segmented, counter-rotating bezels.
+        segments = 2 + self.rank // 2
+        pitch = 360 // segments
+        rotation = self.progress * (5 + 8 * self.rank)
+        painter.setPen(QPen(self.color, 1.1 + self.rank * .19))
+        for index in range(segments):
+            start = 35 + pitch * index + rotation
+            painter.drawArc(mount.adjusted(3, 3, -3, -3), round(start * 16), (pitch // 2) * 16)
+        if self.rank >= 3:
+            inner_ring = mount.adjusted(6, 6, -6, -6)
+            painter.setPen(QPen(self.color.lighter(135), 1.1))
+            for start in (105, 285):
+                painter.drawArc(inner_ring, round((start - rotation) * 16), (9 * self.rank) * 16)
+        paint_medal(painter, mount.center() - QPointF(0, 2), 17, self.color, earned=True, group=self.group)
         painter.end()
 
 
 class _MedalCard(LayeredPanel):
+    DETAIL_INK = "#2A4056"
+    CLOSED_MIN_HEIGHT = 133
+    expansionRequested = Signal()
+
     def __init__(self, entry, font_family):
         name = str(entry["name"])
         group = entry.get("group") or "战绩"
-        color = GROUPS.get(group, ("", tone.BLUE))[1]
-        super().__init__(accent=color, cut=15)
-        self.setMinimumHeight(133)
-        self.setAccessibleName(f"{name} · 已达成")
+        style = rarity_style(entry.get("rarity"))
+        super().__init__(accent=style.accent, cut=15)
+        self.rarity = style
+        self._background_enabled = True
+        self._texture_pointer = None
+        self._texture_motion = QVariantAnimation(self)
+        self._texture_motion.setDuration(155)
+        self._texture_motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._texture_motion.valueChanged.connect(self._texture_frame)
+        self._ornament_phase = 0.
+        self._ornament = None
+        if style.rank >= 3:
+            self._ornament = QVariantAnimation(self)
+            self._ornament.setStartValue(0.)
+            self._ornament.setEndValue(1.)
+            self._ornament.setDuration(4200 - 350 * style.rank)
+            self._ornament.setLoopCount(-1)
+            self._ornament.valueChanged.connect(self._ornament_frame)
+        self.setProperty("backgroundEffect", True)
+        self.setMinimumHeight(self.CLOSED_MIN_HEIGHT)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._caption = f"{name} · 已达成 · {style.label}"
+        self._expanded = False
+        self._pressed = False
+        self._detail_progress = 0.
+        self._detail_base_height = self.CLOSED_MIN_HEIGHT
+        self._detail_animation = QVariantAnimation(self)
+        self._detail_animation.setStartValue(0.)
+        self._detail_animation.setEndValue(1.)
+        self._detail_animation.setDuration(230)
+        self._detail_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._detail_animation.valueChanged.connect(self._detail_frame)
+        self._detail_animation.finished.connect(self._settle_details)
         box = QVBoxLayout(self)
         self._position_content()
         box.setSpacing(4)
         row = QHBoxLayout()
         row.setSpacing(10)
-        row.addWidget(_MedalIcon(QColor(color), group))
+        self.medal = _MedalIcon(style, group)
+        row.addWidget(self.medal)
         words = QVBoxLayout()
-        words.setSpacing(0)
-        group_ink = QColor(color).darker(240).name()
-        words.addWidget(_label(_group_label(group), color=group_ink, bold=True))
+        words.setSpacing(2)
+        tags = QHBoxLayout()
+        tags.setSpacing(6)
+        tags.addWidget(RarityWordmark(style), 0, Qt.AlignmentFlag.AlignVCenter)
+        tags.addWidget(_label(_group_label(group), pixels=12, color=self.DETAIL_INK), 1)
+        words.addLayout(tags)
         header = _label(name, pixels=19, family=font_family, bold=True)
         words.addWidget(header)
         row.addLayout(words, 1)
         box.addLayout(row)
+        # The bundled Chinese faces omit the mathematical comparison signs.
+        measure_fonts = ("Microsoft YaHei UI", load_presentation_fonts()["tech"], font_family)
         rule = str(entry.get("requirement") or "")
         if rule:
-            box.addWidget(_label(rule, color=tone.MUTED))
-        box.addStretch()
-        value = _measure(entry)
+            box.addWidget(_label(rule, pixels=13, family=measure_fonts, color=self.DETAIL_INK))
+        self._summary_gap = QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+        box.addSpacerItem(self._summary_gap)
+        ship_match = entry.get("id") == "ship_damage_114514"
+        value = "、".join(entry.get("matched_ships") or ()) if ship_match else _measure(entry)
         if value:
-            box.addWidget(_label(value, pixels=17, family=font_family, bold=True))
-        flavor = str(entry.get("description") or "")
-        if flavor:
-            self.setToolTip(f"<p>{escape(flavor)}</p>")
-        self.setAccessibleDescription("。".join(t for t in (rule, value, flavor) if t))
+            measure = _label(value, pixels=17, family=measure_fonts, bold=True)
+            if ship_match:
+                measure.setObjectName("achievementMatchedShips")
+                measure.setAccessibleName(f"达标战舰 {value}")
+            box.addWidget(measure)
+        self._summary = (rule, value)
+        self._detail_pane = QWidget(self)
+        detail_box = QVBoxLayout(self._detail_pane)
+        detail_box.setContentsMargins(0, 14, 0, 4)
+        detail_box.setSpacing(0)
+        self.description = _label(str(entry.get("description") or ""), pixels=18,
+                                  family=chinese_sans_families(), color="#161C25")
+        self.description.setObjectName("achievementDescription")
+        self.description.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        detail_box.addWidget(self.description)
+        self._detail_pane.hide()
+        box.addWidget(self._detail_pane)
+        self._update_accessibility()
+
+    def _update_accessibility(self):
+        self.setAccessibleName(f"{self._caption} · {'已展开' if self._expanded else '展开描述'}")
+        description = self.description.text() if self._expanded else "按回车键或空格键展开描述"
+        self.setAccessibleDescription("。".join(value for value in (*self._summary, description) if value))
+
+    def set_expanded(self, expanded, *, animate=True):
+        if self._expanded == expanded:
+            return
+        self._detail_animation.stop()
+        self._expanded = expanded
+        self._summary_gap.changeSize(0, 0, QSizePolicy.Policy.Minimum,
+                                     QSizePolicy.Policy.Fixed if expanded else QSizePolicy.Policy.Expanding)
+        self._position_content()
+        self.layout().invalidate()
+        self._update_accessibility()
+        if expanded:
+            self._detail_base_height = max(self.CLOSED_MIN_HEIGHT, self.height())
+            self._detail_pane.setVisible(bool(self.description.text()))
+            if animate and motion_enabled(self) and not self.window().isMinimized():
+                self._detail_frame(0.)
+                self._detail_animation.start()
+            else:
+                self._settle_details()
+        else:
+            self._detail_pane.hide()
+            self._detail_progress = 0.
+            self.setMinimumHeight(self.CLOSED_MIN_HEIGHT)
+        self.update()
+
+    def _detail_frame(self, progress):
+        self._detail_progress = float(progress)
+        if self._expanded:
+            target_height = max(188, self._detail_base_height + 28)
+            self.setMinimumHeight(round(self._detail_base_height + (target_height - self._detail_base_height)
+                                        * self._detail_progress))
+            margins = self.layout().contentsMargins()
+            available = max(1, self.width() - margins.left() - margins.right())
+            body_height = self.description.heightForWidth(available)
+            if body_height <= 0:
+                body_height = self.description.sizeHint().height()
+            self._detail_pane.setMaximumHeight(round((body_height + 18) * self._detail_progress))
+        self.update()
+
+    def _settle_details(self):
+        self._detail_progress = float(self._expanded)
+        if self._expanded:
+            self.setMinimumHeight(max(188, self._detail_base_height + 28))
+            self._detail_pane.setMaximumHeight(16777215)  # Qt's default widget height limit.
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._expanded and event.oldSize().width() != event.size().width():
+            self._position_content()
+            if self._detail_progress < 1.:
+                self._detail_frame(self._detail_progress)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._pressed:
+            self._pressed = False
+            if self.rect().contains(event.position().toPoint()):
+                self.expansionRequested.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        toggle = key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space) or (
+            self._expanded and key == Qt.Key.Key_Escape)
+        if toggle:
+            if not event.isAutoRepeat():
+                self.expansionRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _position_content(self):
         # Keep the total inset constant so the grid and the hit target stay still.
-        lift = round(3 * self.hover_progress)
-        self.layout().setContentsMargins(18, 13 - lift, 24, 17 + lift)
+        lift = round((1 + self.rarity.rank) * self.hover_progress)
+        if self._expanded:
+            self.layout().setContentsMargins(28, 26, max(42, round(expanded_art_width(self.width()))), 26)
+        else:
+            self.layout().setContentsMargins(18, 13 - lift, 24, 17 + lift)
 
     def _frame(self, value):
         super()._frame(value)
+        self.medal.progress = self.hover_progress
+        self.medal.update()
         self._position_content()
+
+    def _texture_frame(self, point):
+        self._texture_pointer = QPointF(point)
+        self.update()
+
+    def _ornament_frame(self, phase):
+        self._ornament_phase = float(phase)
+        self.update()
+
+    def _follow_pointer(self, point):
+        if not self._background_enabled or not self.isVisible() or not motion_enabled(self) or self.window().isMinimized():
+            return
+        if self._texture_pointer is not None and point == self._texture_motion.endValue():
+            return
+        current = self._texture_pointer if self._texture_pointer is not None else QPointF(self.rect().center())
+        self._texture_motion.stop()
+        self._texture_motion.setStartValue(current)
+        self._texture_motion.setEndValue(point)
+        self._texture_motion.start()
+
+    def _reset_texture(self):
+        self._texture_motion.stop()
+        self._texture_pointer = None
+        if self._ornament is not None:
+            self._ornament.stop()
+        self._ornament_phase = 0.
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if (self._ornament is not None and self._background_enabled and self.isVisible()
+                and motion_enabled(self) and not self.window().isMinimized()):
+            self._ornament.start()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._ornament is not None:
+            self._ornament.stop()
+        if self.hover_progress > 0.:
+            self._follow_pointer(QPointF(self.rect().center()))
+
+    def event(self, event):
+        # HoverMove also reaches this card when the pointer crosses its labels.
+        if event.type() == QEvent.Type.HoverMove and isinstance(event, QHoverEvent):
+            self._follow_pointer(self.mapFromGlobal(event.globalPosition()))
+        return super().event(event)
 
     def _finish(self, *_):
         super()._finish()
+        self._pressed = False
+        self._detail_animation.stop()
+        self._settle_details()
+        self._reset_texture()
+        self.medal.progress = 0.
+        self.medal.update()
         self._position_content()
+
+    def set_background_enabled(self, enabled):
+        self._background_enabled = bool(enabled)
+        if not self._background_enabled:
+            self._reset_texture()
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        settings = getattr(self.window(), "client_preferences", {})
+        self.set_background_enabled(settings.get("background_enabled", self._background_enabled))
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         depth = self.hover_progress
-        plate = QRectF(self.rect()).adjusted(2, 5, -8, -8)
+        if self._expanded:
+            surface = QRectF(self.rect())
+            paint_expanded_achievement(painter, surface, self.rarity,
+                                       progress=max(depth, .66 * self._detail_progress), phase=self._ornament_phase,
+                                       background_enabled=self._background_enabled)
+            painter.end()
+            return
+        rank = self.rarity.rank
+        plate = QRectF(self.rect()).adjusted(3, 7, -8, -8)
+        accent = QColor(self.accent)
+        ink = QColor(self.rarity.ink)
         rear = panel_path(plate.translated(3, 3), self.cut)
-        shadow = panel_path(plate.translated(4 + depth, 4 + 2 * depth), self.cut)
-        painter.fillPath(shadow, QColor(19, 43, 66, 29 + round(29 * depth)))
+        shadow = panel_path(plate.translated(4 + depth, 4 + .5 * rank * depth), self.cut)
+        painter.fillPath(shadow, QColor(19, 43, 66, 29 + round((12 + 6 * rank) * depth)))
         backing = QLinearGradient(plate.topLeft(), plate.bottomRight())
-        backing.setColorAt(0, QColor("#72A9BC"))
-        backing.setColorAt(.52, QColor("#C7D9E4"))
-        backing.setColorAt(1, QColor("#C76B9D"))
+        backing.setColorAt(0, ink)
+        backing.setColorAt(.58, accent)
+        backing.setColorAt(1, ink)
         painter.fillPath(rear, backing)
 
-        face = plate.translated(0, -3 * depth)
+        face = plate.translated(0, -(1 + rank) * depth)
+        if depth > 0 and rank >= 3:
+            # A second metal sheet separates the elevated face from its mounting.
+            sheet = panel_path(plate.translated(1.5, 2 - 2 * depth), self.cut)
+            anodized = QColor(ink).darker(185)
+            anodized.setAlpha(round(210 * depth))
+            painter.fillPath(sheet, anodized)
         outline = panel_path(face, self.cut)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if depth > 0:
+            for width, alpha in ((2 + rank, 18 + 7 * rank), (1.5 + .5 * rank, 45 + 15 * rank)):
+                glow = QColor(accent)
+                glow.setAlpha(round(alpha * depth))
+                painter.setPen(QPen(glow, width))
+                painter.drawPath(outline)
         paper = QLinearGradient(face.topLeft(), face.bottomRight())
         paper.setColorAt(0, QColor("#FFFFFF"))
         paper.setColorAt(.60, QColor("#F3F8FD"))
         paper.setColorAt(1, QColor("#E6EFF7"))
         painter.fillPath(outline, paper)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#A9BFD2"), 1))
+        wash = QLinearGradient(face.topRight(), face.center())
+        tint = QColor(accent)
+        tint.setAlpha(25 + 5 * rank + round((12 + 8 * rank) * depth))
+        wash.setColorAt(0, tint)
+        tint.setAlpha(0)
+        wash.setColorAt(1, tint)
+        painter.fillPath(outline, wash)
+        if self._background_enabled:
+            paint_achievement_texture(painter, face, outline, self.rarity, depth, self._texture_pointer,
+                                      phase=self._ornament_phase)
+        rim = QColor(ink)
+        rim.setAlpha(130 + round(125 * depth))
+        painter.setPen(QPen(rim, 1 + (.2 + .16 * rank) * depth))
         painter.drawPath(outline)
 
-        # Two offset rails meet at the clipped shoulder; only the rim catches the light.
+        # The shoulder carries the medal metal against a dark base even on white medals.
         right, top = face.right(), face.top()
-        shoulder = QPolygonF([QPointF(right - 53, top + 4), QPointF(right - 18, top + 4),
-                              QPointF(right - 4, top + 18), QPointF(right - 4, top + 28)])
-        painter.setPen(QPen(QColor("#BCCDDC"), 1))
+        shoulder = QPolygonF([QPointF(right - 40, top + 4), QPointF(right - 17, top + 4),
+                              QPointF(right - 4, top + 17), QPointF(right - 4, top + 24)])
+        painter.setPen(QPen(ink, 3.5))
         painter.drawPolyline(shoulder)
-        painter.setPen(QPen(QColor(self.accent), 2))
-        painter.drawLine(QPointF(face.left() + 10, top + 1), QPointF(face.left() + 34, top + 1))
-        if depth > 0:
-            lead = face.left() + face.width() * (.12 + .84 * depth)
-            sweep = QLinearGradient(lead - 65, top, lead + 22, top)
-            sweep.setColorAt(0, QColor(67, 184, 215, 0))
-            sweep.setColorAt(.45, QColor(70, 170, 199, round(220 * depth)))
-            sweep.setColorAt(.74, QColor(103, 222, 239, round(255 * depth)))
-            sweep.setColorAt(.88, QColor(219, 106, 172, round(240 * depth)))
-            sweep.setColorAt(1, QColor(219, 106, 172, 0))
-            painter.setPen(QPen(sweep, 2))
-            rim = QPolygonF([QPointF(face.left() + 8, top), QPointF(right - self.cut, top),
-                             QPointF(right, top + self.cut), QPointF(right, top + 29)])
-            painter.drawPolyline(rim)
+        painter.setPen(QPen(accent, 1.5))
+        painter.drawPolyline(shoulder)
+        if self._background_enabled and depth > 0 and rank:
+            lead = face.left() + (face.width() - self.cut) * depth
+            sweep = QLinearGradient(lead - 20 - 12 * rank, top, lead + 12 + 3 * rank, top)
+            light = accent.lighter(145)
+            light.setAlphaF(depth)
+            accent.setAlphaF(depth)
+            sweep.setColorAt(0, tint)
+            sweep.setColorAt(.60, accent)
+            sweep.setColorAt(.78, light)
+            sweep.setColorAt(1, tint)
+            painter.setPen(QPen(sweep, 1.2 + .25 * rank))
+            rail = QPolygonF([QPointF(face.left() + 8, top), QPointF(right - self.cut, top),
+                              QPointF(right, top + self.cut), QPointF(right, top + 29)])
+            painter.drawPolyline(rail)
+            # Each additional trace stays in the exposed bottom/right bevel.
+            # The gold and crimson grades resolve into a segmented terminal.
+            if rank >= 2:
+                bottom = face.bottom()
+                for index in range(1 + int(rank == 5)):
+                    x = right - 3 - 3 * index
+                    y = bottom - 3 - 3 * index
+                    reach = (17 + 10 * rank) * depth
+                    elbow = QPointF(x - 5, y)
+                    trace = QPolygonF([QPointF(x - 5 - reach, y), elbow, QPointF(x, y - 5),
+                                       QPointF(x, y - 5 - reach * .38)])
+                    tracer = QColor(ink)
+                    tracer.setAlpha(round((95 + 14 * rank) * depth))
+                    painter.setPen(QPen(tracer, 1))
+                    painter.drawPolyline(trace)
+                    if rank >= 4:
+                        painter.setPen(QPen(tracer, 2.4))
+                        for tick in range(rank - 1):
+                            end = QPointF(elbow.x() - 6 - 6 * tick, y)
+                            painter.drawLine(end - QPointF(3, 0), end)
+                if rank >= 3:
+                    painter.setPen(QPen(accent, 1))
+                    painter.drawLine(QPointF(right - self.cut + 2, top + 7),
+                                     QPointF(right - 5, top + self.cut))
         painter.end()
 
 
@@ -317,6 +637,7 @@ class AchievementGallery(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
+        self._expanded_id = None
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._account = None
         self._cards = []
@@ -347,16 +668,14 @@ class AchievementGallery(QScrollArea):
         self.setWidget(content)
 
     def set_detail(self, detail, account):
-        rows = detail.get("achievement_gallery")
-        if rows is None:
-            rows = [{"name": row[0], "requirement": row[1], "group": "战绩", "status": "earned"}
-                    for row in detail.get("challenges", ()) if len(row) >= 2]
-        rows = [row for row in rows if row.get("status") == "earned"]
+        rows = sorted(earned_achievements(detail), key=lambda row: rarity_style(row["rarity"]).rank,
+                      reverse=True)
         signature = (account, rows)
         if self._detail == signature:
             return
         self._detail = signature
         if account != self._account:
+            self._expanded_id = None
             self.verticalScrollBar().setValue(0)
         with QSignalBlocker(self.group):
             previous = self.group.currentData() if account == self._account else None
@@ -374,6 +693,9 @@ class AchievementGallery(QScrollArea):
             widget.deleteLater()
         fonts = load_presentation_fonts()
         self._cards = [(row, _MedalCard(row, fonts["chinese_body"])) for row in rows]
+        for row, card in self._cards:
+            card.expansionRequested.connect(lambda identifier=row["id"]: self._toggle_expansion(identifier))
+            card._detail_animation.finished.connect(lambda selected=card: self._reveal_expanded(selected))
         self.banner.set_summary(len(rows))
         self._render()
 
@@ -384,21 +706,52 @@ class AchievementGallery(QScrollArea):
     def _column_count(self):
         return min(4, max(1, (self.viewport().width() - 32) // 260))
 
+    def _toggle_expansion(self, identifier):
+        self._expanded_id = None if self._expanded_id == identifier else identifier
+        selected = self._render()
+        self._reveal_expanded(selected)
+
+    def _reveal_expanded(self, card):
+        if card is not None and card._expanded and card.isVisible():
+            self.widget().layout().activate()
+            self.ensureWidgetVisible(card, 12, 16)
+
     def _render(self, *_):
         group = self.group.currentData()
         columns = self._columns = self._column_count()
-        visible = 0
+        visible = []
+        expanded = None
         for index in range(4):
             self.cards.setColumnStretch(index, int(index < columns))
         for row, widget in self._cards:
             self.cards.removeWidget(widget)
-            include = (row.get("group") or "战绩") == group or group is None
-            if include:
-                line, column = divmod(visible, columns)
-                self.cards.addWidget(widget, line, column)
-                visible += 1
-            widget.setVisible(include)
-        self.empty.setVisible(visible == 0)
+            if group is not None and (row.get("group") or "战绩") != group:
+                widget.set_expanded(False)
+                widget.hide()
+                continue
+            if row["id"] == self._expanded_id:
+                expanded = widget
+            visible.append(widget)
+
+        if expanded is not None:
+            # Occupy the selected card's original row, then repack that row's neighbours underneath.
+            row_start = visible.index(expanded) // columns * columns
+            visible.remove(expanded)
+            self.cards.addWidget(expanded, row_start // columns, 0, 1, columns)
+        else:
+            self._expanded_id = None
+            row_start = len(visible)
+
+        for index, widget in enumerate(visible):
+            line, column = divmod(index, columns)
+            self.cards.addWidget(widget, line + int(index >= row_start), column)
+            widget.set_expanded(False)
+            widget.show()
+        if expanded is not None:
+            expanded.show()
+            expanded.set_expanded(True, animate=self.isVisible())
+        self.empty.setVisible(not visible and expanded is None)
+        return expanded
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -415,7 +768,7 @@ class ShipCollectionSummary(LayeredPanel):
         box = QVBoxLayout(self)
         box.setContentsMargins(18, 11, 28, 14)
         box.setSpacing(5)
-        box.addWidget(_label("舰船系列出战 · 随机战", pixels=15, bold=True))
+        box.addWidget(_label("战舰系列出战 · 随机战", pixels=15, bold=True))
         self.cards = QHBoxLayout()
         self.cards.setSpacing(14)
         box.addLayout(self.cards)

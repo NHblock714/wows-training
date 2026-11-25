@@ -2,6 +2,7 @@
 
 Reference: https://developers.wargaming.net/reference/all/wows/account/info/
 https://developers.wargaming.net/reference/all/wows/account/list/
+https://developers.wargaming.net/reference/na/wows/account/achievements/
 https://developers.wargaming.net/reference/eu/wows/ships/stats/
 Checked 2026-10-21. Account extras use statistics.<mode>; ship extras use <mode>.
 """
@@ -21,6 +22,40 @@ REGIONS = {"asia": "https://api.worldofwarships.asia", "eu": "https://api.worldo
 MODES = frozenset(("pvp", "pve", "pvp_solo", "pvp_div2", "pvp_div3", "rank_solo"))
 ACCOUNT_MODES = MODES | {"club", "oper_solo", "oper_div"}
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+_BATTLE_ACHIEVEMENT_KEYS = {
+    "SOLO_WARRIOR": "PCH002_OneSoldierInTheField",
+    "DREADNOUGHT": "PCH004_Dreadnought",
+    "WITHERING": "PCH006_Withering",
+    "RETRIBUTION": "PCH010_Retribution",
+    "INSTANT_KILL": "PCH011_InstantKill",
+    "ARSONIST": "PCH012_Arsonist",
+    "HEADBUTT": "PCH014_Headbutt",
+    "UNSINKABLE": "PCH018_Unsinkable",
+    "DETONATED": "PCH019_Detonated",
+    "PVE_HON_WIN_ALL_DONE": "PCH097_PVE_HON_WIN_ALL_DONE",
+}
+
+
+def normalize_battle_achievements(battle):
+    """Keep official award counts and expose canonical keys used by saved profiles."""
+    if not isinstance(battle, dict) or any(
+        not isinstance(key, str) or type(count) is not int or count < 0
+        for key, count in battle.items()
+    ):
+        return None
+    normalized = dict(battle)
+    by_key = {key.casefold(): count for key, count in battle.items()}
+    for canonical, official in _BATTLE_ACHIEVEMENT_KEYS.items():
+        count = by_key.get(canonical.casefold(), by_key.get(official.casefold()))
+        if count is not None:
+            normalized.setdefault(canonical, count)
+    return normalized
+
+
+def _account_created_at(info):
+    timestamp = (info or {}).get("created_at")
+    return timestamp if type(timestamp) is int and 0 < timestamp <= 253402300799 else None
 
 
 class _Cancelled(Exception):
@@ -260,6 +295,7 @@ class PublicStatsClient:
                 if not isinstance(stats,dict) or type(stats.get('battles')) is not int or stats['battles']<0:raise ValueError('Invalid mode statistics')
                 values[mode]={'status':'ok' if stats['battles'] else 'no_battles','statistics':stats}
             result.update(status='ok',data={'nickname':info.get('nickname'),'modes':values,
+                'created_at':_account_created_at(info),
                 'source_updated_at':info.get('updated_at'),'stats_updated_at':info.get('stats_updated_at')})
         except Exception as error:return self._error(result,error)
         return result
@@ -295,8 +331,8 @@ class PublicStatsClient:
             if result["status"] == "private":
                 return result
             record = data.get(identifier) if isinstance(data, dict) else None
-            battles = record.get("battle") if isinstance(record, dict) else None
-            if not isinstance(battles, dict) or any(type(v) is not int or v < 0 for v in battles.values()):
+            battles = normalize_battle_achievements(record.get("battle")) if isinstance(record, dict) else None
+            if battles is None:
                 return dict(result, status="not_fetched", reason="achievement_data_unavailable")
             result.update(status="ok", data={"battle": battles})
         except Exception as error:
@@ -385,7 +421,8 @@ class PublicStatsClient:
                 raise ValueError("Battle count unavailable")
             result.update(status="no_battles" if stats["battles"] == 0 else "ok", data={
                 "nickname": info.get("nickname"), "account_id": result["account_id"], "mode": mode,
-                "statistics": stats, "source_updated_at": info.get("updated_at"), "stats_updated_at": info.get("stats_updated_at"),
+                "statistics": stats, "created_at": _account_created_at(info),
+                "source_updated_at": info.get("updated_at"), "stats_updated_at": info.get("stats_updated_at"),
             })
         except Exception as error:
             return self._error(result, error)

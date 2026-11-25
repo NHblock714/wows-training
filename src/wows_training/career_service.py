@@ -16,7 +16,8 @@ from urllib.request import Request,build_opener
 from .career_catalog import enrich_ship_catalog
 from .career_rating import metrics,project_ships,summarize_ships,number,mechanical_means
 from .credential_store import SecretStore, SecretStoreError
-from .public_stats import PublicStatsClient,REGIONS,ACCOUNT_MODES,MODES,_positive_id,_NoRedirect
+from .numbers_leaderboard_feed import account_rankings, feed_url, fetch_numbers_feed
+from .public_stats import PublicStatsClient,REGIONS,ACCOUNT_MODES,MODES,_account_created_at,_positive_id,_NoRedirect
 from .workbench_store import WorkbenchStore
 
 MODE_ORDER=('pvp','pvp_solo','pvp_div2','pvp_div3','pve','rank_solo','club','oper_solo','oper_div')
@@ -126,13 +127,15 @@ def _fetch_expected(cancel):
 
 
 class CareerService:
-    def __init__(self,root,bundle=None,*,transport=None,secrets=None,references=None,reference_transport=None):
+    def __init__(self,root,bundle=None,*,transport=None,secrets=None,references=None,reference_transport=None,
+                 numbers_transport=None):
         self.store=WorkbenchStore(root);self.root=self.store.root;self.secrets=secrets or SecretStore(root)
         self._public_application_id = _bundled_application_id()
         self.transport=transport;self.references=references if references is not None else load_references()
         self.legacy_references=deepcopy(self.references.get('legacy') or {k:self.references.get(k,{}) for k in ('expected','encyclopedia','benchmarks','metadata')})
         self.legacy_references['legacy_only']=True
         self.reference_transport=reference_transport or _fetch_expected
+        self.numbers_transport=numbers_transport or fetch_numbers_feed
         self.catalog=enrich_ship_catalog(bundle.ship_catalog()) if bundle is not None else {}
         self._reference_id=None;self._encyclopedia_id=None
         self._reload_reference()
@@ -285,7 +288,7 @@ class CareerService:
         return self.store.save_run('career_snapshot',(payload.get('nickname') or payload['account_id'])+' · '+payload['region'],payload)
 
     def refresh(self,region,account_id,mode='pvp',cancel=None,progress=None,*,include_achievements=False,
-                include_all_fleets=False,record_failures=True):
+                include_all_fleets=False,record_failures=True,include_numbers_rankings=False):
         self._reload_reference()
         region,account_id=_identity(region,account_id)
         if mode not in ACCOUNT_MODES:raise ValueError('不支持该战斗模式')
@@ -325,6 +328,7 @@ class CareerService:
             'nickname':nickname if isinstance(nickname,str) and nickname else account_id,'account_status':state,'requested_mode':mode,
             'mode_results':modes,'reason':account.get('reason'),'timestamp':timestamp,
             'time_kind':'fetched_at_utc' if state in ('ok','private','no_battles','not_found') else 'request_attempt',
+            'account_created_at':data.get('created_at') if state=='ok' else None,
             'source_updated_at':data.get('source_updated_at'),'stats_updated_at':data.get('stats_updated_at'),
             'source':account.get('source'),'created_at_utc':utc()}
         if not record_failures and state in ('error', 'not_fetched'):
@@ -334,6 +338,29 @@ class CareerService:
             result=client.achievements(region,account_id)
             _cancel(cancel)
             payload['achievements']={'status':result['status'], 'battle':(result.get('data') or {}).get('battle')}
+        pvp_fleet = (modes.get('pvp') or {}).get('ships') or {}
+        if state == 'ok' and pvp_fleet.get('status') == 'ok':
+            if include_numbers_rankings:
+                if progress:
+                    progress('读取公开单舰榜…')
+                try:
+                    feed = self.numbers_transport(region, cancel)
+                    ranking = account_rankings(feed, region, account_id)
+                    ranking.update(feed_url=feed_url(region), feed_sha256=digest(feed))
+                except InterruptedError:
+                    raise
+                except (OSError, ValueError):
+                    payload['numbers_rankings_status'] = 'unavailable'
+                else:
+                    payload['numbers_rankings'] = ranking
+                    payload['numbers_rankings_status'] = 'ok'
+                _cancel(cancel)
+            else:
+                # Refreshes elsewhere can write a newer WG snapshot without requesting the leaderboard.
+                previous = next(iter(self._records(region, account_id)), {}).get('payload', {})
+                if previous.get('account_status') == 'ok' and previous.get('numbers_rankings_status') in ('ok', 'cached'):
+                    payload['numbers_rankings'] = previous['numbers_rankings']
+                    payload['numbers_rankings_status'] = 'cached'
         record=self._save(payload)
         return self._project(record,mode)
 
@@ -388,6 +415,7 @@ class CareerService:
             payload={'schema_version':1,'source_type':'legacy_cache','region':region,'account_id':account_id,
                 'nickname':info.get('nickname') if info else account_id,'account_status':state,'mode_results':modes,
                 'timestamp':max(r['file_mtime_utc'] for r in group['files']),'time_kind':'legacy_file_mtime','created_at_utc':utc(),
+                'account_created_at':_account_created_at(info) if state=='ok' else None,
                 'source_updated_at':info.get('updated_at') if info and number(info.get('updated_at')) else None,'stats_updated_at':info.get('stats_updated_at') if info and number(info.get('stats_updated_at')) else None,
                 'source':{'provider':'原 F1 WOWS 本地缓存','files':group['files'],'fetched_at_utc':None,'imported_at_utc':utc(),
                           'scope':'historical_public_snapshot; filesystem time is not a verified fetch time'},
@@ -406,7 +434,7 @@ class CareerService:
         return {'status':status,'reason':reason,'region':region,'account_id':account_id,'nickname':account_id,'mode':mode,'modes':[],
             'metrics':{},'rating':None,'ships':[],'class_distribution':[],'tier_distribution':[],'ace_ship':None,
             'source':{},'snapshot_id':None,'timestamp':None,'time_kind':None,'is_stale':True,
-            'account_status':status,'ships_status':'not_fetched'}
+            'account_status':status,'account_created_at':None,'ships_status':'not_fetched'}
 
     def _project(self,record,mode):
         value=record['payload'];result=self._empty(value['region'],value['account_id'],mode,value['account_status'],value.get('reason'))
@@ -418,6 +446,10 @@ class CareerService:
             try:result['is_stale']=(datetime.now(timezone.utc)-datetime.fromisoformat(result['timestamp'])).total_seconds()>300
             except (TypeError,ValueError):pass
         if value['account_status']!='ok':return result
+        result['account_created_at']=value.get('account_created_at')
+        if mode == 'pvp' and value.get('numbers_rankings_status'):
+            result['numbers_rankings_status'] = value['numbers_rankings_status']
+            result['numbers_rankings_observed_on'] = (value.get('numbers_rankings') or {}).get('observed_on')
         awards=value.get('achievements') or {}
         result['achievements']=deepcopy(awards.get('battle')) if awards.get('status')=='ok' else None
         if mode not in ACCOUNT_MODES:return dict(result,status='unsupported',reason='mode_not_supported')

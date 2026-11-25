@@ -1,5 +1,20 @@
 """F1 WOWS offline scoring. Adapted from wows_analyzer/personal_rating.py."""
 import math
+from numbers import Integral, Real
+
+from ..public_stats import _positive_id
+
+
+ACHIEVEMENT_POWER_BONUSES = {
+    "普通": 0.005,
+    "罕见": 0.0075,
+    "稀有": 0.01,
+    "史诗": 0.015,
+    "传奇": 0.02,
+    "神话": 0.03,
+}
+ACHIEVEMENT_POWER_CAP = 0.40
+SHIP_POOL_POWER_CAP = 0.10
 
 
 def compute_pr(n_dmg, n_frags, n_wr):
@@ -28,7 +43,7 @@ def compute_battle_power(pr):
     - PR 是线性的, 玩家从 1700 到 2500 看不出量级差距, sigmoid 把高分段拉开
     - 又限制了天花板 — 没有这个的话 PR=2500 直接爆出 200k+ 战力, 视觉上离谱
 
-    上层调用要继续乘 4 个 modifiers (apply_battle_power_modifiers)。
+    上层调用要继续乘战力修正系数 (apply_battle_power_modifiers)。
     """
     if pr is None or pr <= 0:
         return 0
@@ -54,13 +69,26 @@ def compute_ship_battle_power(ship_pr, battles):
     return int(base * investment)
 
 
-def compute_battle_power_modifiers(stats, ships_df, n_challenges=0):
-    """**4 个修正系数** — 这是"段子感"的来源, 也是项目独有特色.
+def _ship_pool_modifier(ship_battle_records):
+    played_ids = set()
+    for ship_id, battles in ship_battle_records:
+        if not isinstance(battles, Real) or isinstance(battles, bool) or not 0 < battles < 2**64 or battles % 1:
+            continue
+        if isinstance(ship_id, Integral) and not isinstance(ship_id, bool):
+            ship_id = int(ship_id)
+        identifier = _positive_id(ship_id)
+        if identifier is not None:
+            played_ids.add(identifier)
+    return 1.0 + min(SHIP_POOL_POWER_CAP, 0.06 * math.log10(1 + len(played_ids) / 20))
 
-    返回 `{challenge, horse, variety, veteran}` 四个浮点, 上层乘起来作用到 BP_base。
 
-    - **challenge**: `1.0 + 0.02 × N_完成挑战` (上限 1.40, 21 个全完成)
-      鼓励玩家挑战不同条件的"成就"。
+def compute_battle_power_modifiers(stats, ships_df, n_challenges=0, *, achievement_rarities=None,
+                                   ship_battle_records=None):
+    """计算综合战力修正系数。上层将各项系数相乘后作用到基础战力。
+
+    返回 `{challenge, horse, variety, veteran, ship_pool}`。
+
+    - **challenge**: 累加各项已达成成就的稀有度加成后再加 1.0（上限 1.40）。
 
     - **horse (🐴)**: 水面舰艇占比的"鄙视链"系数
         - ≥ 80% 水面 → 1.10 (绅士奖)
@@ -74,15 +102,25 @@ def compute_battle_power_modifiers(stats, ships_df, n_challenges=0):
     - **veteran (🎖️ 老兵)**: `1.0 + log10(1 + total/100) × 0.06` (上限 1.20)
       场次越多越加成. log 增长, 1000 场 ≈ 1.062, 10000 场 ≈ 1.124, 100000 场 ≈ 1.183.
 
+    - **ship_pool**: `1.0 + log10(1 + count/20) × 0.06`（上限 1.10）。
+      count 为有随机战出战记录的不同舰船 ID 数量。
+
     依赖:
     - stats: 仅用于占位 (PlayerStats 对象), 现版本未直接读取
     - ships_df: 必需, 用于算 horse / variety / veteran
-    - n_challenges: 由调用方先算 (challenges.get_completed_challenges) 再传入
+    - achievement_rarities: 每项已达成成就的稀有度，由调用方按成就 ID 去重
+    - ship_battle_records: 完整随机战舰船记录的 `(ship_id, battles)` 对，缺省时使用 ships_df
+    - n_challenges: 旧的调用方只提供数量时，每项按 2% 计
     """
-    # 默认全部 1.0 (任何条件 不满足 / 数据缺失 → 不加成 不削弱)
-    m = {"challenge": 1.0 + 0.02 * max(0, n_challenges),
-         "horse": 1.0, "variety": 1.0, "veteran": 1.0}
-    if ships_df is None or ships_df.empty:
+    achievement_bonus = (0.02 * max(0, n_challenges) if achievement_rarities is None
+                         else math.fsum(ACHIEVEMENT_POWER_BONUSES.get(rarity, 0.0)
+                                        for rarity in achievement_rarities))
+    if ship_battle_records is None:
+        ship_battle_records = (zip(ships_df["ship_id"], ships_df["battles"])
+                               if ships_df is not None and {"ship_id", "battles"} <= set(ships_df.columns) else ())
+    m = {"challenge": 1.0 + min(ACHIEVEMENT_POWER_CAP, achievement_bonus),
+         "horse": 1.0, "variety": 1.0, "veteran": 1.0, "ship_pool": _ship_pool_modifier(ship_battle_records)}
+    if ships_df is None or ships_df.empty or "battles" not in ships_df:
         return m
     total_b = int(ships_df["battles"].sum())
     if total_b <= 0:
@@ -125,13 +163,13 @@ def compute_battle_power_modifiers(stats, ships_df, n_challenges=0):
 
 
 def apply_battle_power_modifiers(base_bp, modifiers):
-    """把 4 个系数乘到 BP_base 上, 输出最终展示战力。
+    """把修正系数乘到基础战力上，输出最终展示战力。
 
     顺序无关 (乘法可交换), 但写成固定顺序方便 debug。
     """
     if base_bp <= 0 or modifiers is None:
         return base_bp
     mult = 1.0
-    for k in ("challenge", "horse", "variety", "veteran"):
+    for k in ("challenge", "horse", "variety", "veteran", "ship_pool"):
         mult *= modifiers.get(k, 1.0)
     return int(base_bp * mult)

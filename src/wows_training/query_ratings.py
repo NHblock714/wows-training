@@ -6,16 +6,16 @@ from .f1_ratings.models import PlayerStats
 
 def _inputs(career, profile):
     if not profile or profile.get('mode') != 'pvp' or not profile.get('snapshot_id'):
-        return {}, {}, {}
+        return {}, {}, {}, {}
     record = career.store.get_run(profile['snapshot_id'])
-    value = record['payload']
-    if (record['kind'] != 'career_snapshot' or value.get('account_status') != 'ok'
-            or value.get('region') != profile.get('region')
-            or str(value.get('account_id')) != str(profile.get('account_id'))):
-        return {}, {}, {}
-    entry = value.get('mode_results', {}).get('pvp') or {}
-    refs = value.get('rating_references') or career.legacy_references
-    return (entry.get('account') or {}).get('statistics') or {}, entry.get('ships') or {}, refs
+    snapshot = record['payload']
+    if (record['kind'] != 'career_snapshot' or snapshot.get('account_status') != 'ok'
+            or snapshot.get('region') != profile.get('region')
+            or str(snapshot.get('account_id')) != str(profile.get('account_id'))):
+        return {}, {}, {}, {}
+    entry = snapshot.get('mode_results', {}).get('pvp') or {}
+    refs = snapshot.get('rating_references') or career.legacy_references
+    return (entry.get('account') or {}).get('statistics') or {}, entry.get('ships') or {}, refs, snapshot
 
 
 def _frame(fleet, refs):
@@ -30,7 +30,7 @@ def _frame(fleet, refs):
 
 
 def player_frame(career, profile):
-    _, fleet, refs = _inputs(career, profile)
+    _, fleet, refs, _ = _inputs(career, profile)
     return _frame(fleet, refs)
 
 
@@ -63,13 +63,21 @@ def _known_scores(scores, rows):
 
 
 def player_ratings(career, profile, *, species=None, tier=None, achievements=None):
-    raw, fleet, refs = _inputs(career, profile)
+    raw, fleet, refs, snapshot = _inputs(career, profile)
     result = dict(scores={}, strengths=[], weaknesses=[], styles=[], challenges=[], overall=None, power=None,
                   modifiers={}, all_challenges_count=len(challenges.CHALLENGES))
     if achievements is None:
         achievements = (profile or {}).get('achievements')
+    solo_entry = (snapshot.get('mode_results') or {}).get('pvp_solo') or {}
+    rankings = snapshot.get('numbers_rankings')
+    if isinstance(rankings, dict) and 'account_id' in rankings and rankings['account_id'] != snapshot.get('account_id'):
+        rankings = None
     gallery, collections = challenges.evaluate_challenges(raw, fleet, achievements,
-        encyclopedia=refs.get('encyclopedia'), local_catalog=refs.get('local_catalog'))
+        encyclopedia=refs.get('encyclopedia'), local_catalog=refs.get('local_catalog'),
+        solo=(solo_entry.get('account') or {}).get('statistics'),
+        created_at=snapshot.get('account_created_at'), region=snapshot.get('region'),
+        as_of=snapshot.get('timestamp') if snapshot.get('time_kind') == 'fetched_at_utc' else None,
+        numbers_rankings=rankings)
     completed = challenges.get_completed_challenges(gallery)
     result.update(achievement_gallery=gallery, ship_collections=collections, challenges=completed,
                   challenge_complete_data=all(row['complete'] for row in gallery))
@@ -83,7 +91,12 @@ def player_ratings(career, profile, *, species=None, tier=None, achievements=Non
         result['styles'] = battle_style.infer_battle_style(full_scores, stats, frame)
     pr = profile.get('rating') or {}
     if pr.get('battle_power') is not None and not frame.empty:
-        mods = personal_rating.compute_battle_power_modifiers(stats, frame, len(completed))
+        earned_ids = {row['id'] for row in gallery if row['status'] == 'earned'}
+        earned_rarities = {rule.id: rule.rarity for rule in challenges.CHALLENGES if rule.id in earned_ids}
+        ship_battle_records = ((row.get('ship_id'), (row.get('statistics') or {}).get('battles'))
+                               for row in fleet.get('ships') or ())
+        mods = personal_rating.compute_battle_power_modifiers(stats, frame,
+            achievement_rarities=earned_rarities.values(), ship_battle_records=ship_battle_records)
         result.update(power=personal_rating.apply_battle_power_modifiers(pr['battle_power'], mods), modifiers=mods)
     filtered = _subset(frame, species, tier)
     if species is not None or tier is not None:
@@ -106,7 +119,7 @@ def player_ratings(career, profile, *, species=None, tier=None, achievements=Non
 
 
 def ship_ratings(career, profile, ship_id):
-    _, fleet, refs = _inputs(career, profile)
+    _, fleet, refs, _ = _inputs(career, profile)
     frame = _frame(fleet, refs)
     if not frame.empty:
         frame = frame[frame['ship_id'].astype(str) == str(ship_id)]

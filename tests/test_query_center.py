@@ -12,13 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 
-from PySide6.QtWidgets import QApplication,QWidget
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QApplication,QAbstractButton,QDialog,QLineEdit,QPushButton,QToolButton,QVBoxLayout,QWidget
+from PySide6.QtCore import QBuffer, QIODevice, QPoint, Qt
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from wows_training.career_service import CareerService
 from wows_training.desktop.query_center_panel import QueryCenterPanel
 from wows_training.desktop.query_visuals import RatingRadar,RadarFocusOverlay,snapshot_card
 from wows_training.query_center import QueryCenter, player_target
+from wows_training.shared_profile import SharedProfileError
 
 
 class FixtureSecrets:
@@ -47,6 +49,9 @@ class Queries(unittest.TestCase):
         self.career = CareerService(self.folder.name,transport=self.transport,secrets=FixtureSecrets())
         self.service = QueryCenter(self.career)
         self.career.save_settings(True,'demo-queries-test')
+        dog_tags = patch('wows_training.desktop.query_center_panel.fetch_dog_tag', return_value=None)
+        self.fetch_dog_tag = dog_tags.start()
+        self.addCleanup(dog_tags.stop)
 
     def transport(self,url,params,timeout,cancel):
         self.calls.append(url)
@@ -57,7 +62,14 @@ class Queries(unittest.TestCase):
         if url.endswith('/account/info/'):
             if ',' in params['account_id']:
                 return {'status':'ok','data':{'101':info('101'),'102':{'account_id':102,'nickname':'Private','hidden_profile':True},'103':None}}
-            return {'status':'ok','data':{params['account_id']:info(params['account_id'])}}
+            aid = params['account_id']
+            if aid == '102':
+                record = {'account_id':102,'nickname':'Private','hidden_profile':True}
+            elif aid == '103':
+                record = None
+            else:
+                record = info(aid)
+            return {'status':'ok','data':{aid:record}}
         if url.endswith('/clans/info/'):
             return {'status':'ok','data':{'111':{'clan_id':111,'name':'Demo Fleet','tag':'DEMO','members':{
                 str(i):{'account_name':'Demo'+str(i),'role':'private'} for i in (101,102,103)}}}}
@@ -92,6 +104,107 @@ class Queries(unittest.TestCase):
         self.service.toggle_bookmark(player_target('na','123','Demo'))
         self.assertEqual([r['region'] for r in self.service.bookmarks()],['asia'])
 
+    def test_dog_tag_is_cached_and_shared_between_player_favorite_and_snapshot(self):
+        image = QImage(32, 32, QImage.Format.Format_ARGB32)
+        image.fill(QColor('#327BAA'))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.assertTrue(image.save(buffer, 'PNG'))
+        png = bytes(buffer.data())
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        target = player_target('asia', '101', 'Demo101')
+
+        def wait_for_query():
+            until = time.monotonic() + 8
+            while panel.busy and time.monotonic() < until:
+                QTest.qWait(12)
+            self.assertFalse(panel.busy)
+
+        self.fetch_dog_tag.return_value = [object()]
+        with patch('wows_training.desktop.query_center_panel.compose_dog_tag_png', return_value=png):
+            panel.open_target(target, query_missing=True)
+            wait_for_query()
+        self.assertEqual(self.fetch_dog_tag.call_args.args, ('asia', '101'))
+        self.assertFalse(panel.player_dog_tag.pixmap().isNull())
+        self.assertEqual(self.service.cached_dog_tags((('asia', '101'),)), {('asia', '101'): png})
+        panel.bookmark()
+        self.assertEqual(panel.favorites_page._records[0]['_dog_tag_png'], png)
+        with patch('wows_training.desktop.query_center_panel.SnapshotCardDialog') as dialog:
+            panel.open_card()
+            self.assertEqual(dialog.call_args.kwargs['dog_tag_png'], png)
+
+        panel.return_to_favorites()
+        self.career.save_settings(False)
+        self.fetch_dog_tag.reset_mock()
+        panel.open_target(target, query_missing=True)
+        wait_for_query()
+        self.fetch_dog_tag.assert_not_called()
+        self.assertFalse(panel.player_dog_tag.pixmap().isNull())
+
+        self.service.clear_history(target)
+        self.assertEqual(self.service.cached_dog_tags((('asia', '101'),)), {})
+        self.assertEqual(self.service.bookmarks()[0]['id'], '101')
+
+    def test_favorite_back_and_history_clear_use_the_selected_identity(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        QVBoxLayout(host).addWidget(panel)
+        host.resize(1200, 800)
+        self.career.refresh('asia', '104')
+        host.show()
+
+        def wait_for_query():
+            until = time.monotonic() + 8
+            while panel.busy and time.monotonic() < until:
+                QTest.qWait(12)
+            self.assertFalse(panel.busy)
+
+        self.assertIs(panel.stack.currentWidget(), panel.favorites_page)
+        self.assertTrue(panel.detail_actions.isHidden())
+        panel.text.setText('Demo')
+        panel.search()
+        wait_for_query()
+        player_index = next(index for index in range(panel.candidates.count())
+                            if panel.candidates.itemData(index)['kind'] == 'player')
+        panel.candidates.setCurrentIndex(player_index)
+        panel.open_candidate()
+        wait_for_query()
+        self.assertEqual(panel.target['id'], '101')
+        panel.mark.click()
+        self.assertIn('取消收藏', panel.mark.text())
+        panel.back_to_favorites.click()
+        self.assertIs(panel.stack.currentWidget(), panel.favorites_page)
+        self.assertIsNone(panel.target)
+
+        card = panel.favorites_page.findChild(QAbstractButton, 'queryFavoriteCard')
+        self.assertIn('Demo101', card.accessibleName())
+        self.calls.clear()
+        card.click()
+        wait_for_query()
+        self.assertEqual(panel.target['id'], '101')
+        self.assertFalse(self.calls)
+
+        panel.saved.showPopup()
+        clear_buttons = panel.saved.findChildren(QToolButton, 'queryHistoryClear')
+        clear = next(button for button in clear_buttons if 'Demo101' in button.accessibleName() and button.isVisible())
+        clear.click()
+        self.assertIs(panel.stack.currentWidget(), panel.favorites_page)
+        self.assertEqual([row['id'] for row in self.service.directory()], ['104'])
+        self.assertEqual([row['id'] for row in self.service.bookmarks()], ['101'])
+        self.assertEqual([panel.candidates.itemData(i)['kind'] for i in range(1, panel.candidates.count())], ['clan'])
+        self.assertFalse(self.calls)
+        panel.saved.hidePopup()
+
+        card.click()
+        wait_for_query()
+        self.assertEqual(panel.target['id'], '101')
+        self.assertIn('/account/info/', ''.join(self.calls))
+
     def test_batch_privacy_coverage_and_immutable_filtered_clan(self):
         clan=self.service.refresh_clan('asia','111')
         self.assertEqual(set(clan['batch_players']),{'101','102'})
@@ -116,6 +229,123 @@ class Queries(unittest.TestCase):
         self.failure=True
         self.assertEqual(self.career.refresh('asia','101',record_failures=False)['status'],'error')
         self.assertEqual(self.career.profile('asia','101')['snapshot_id'],profile['snapshot_id'])
+
+    def test_confirmed_private_account_has_its_own_placeholder(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        panel.profile_ai = Mock(busy=False)
+
+        def open_player(account_id):
+            panel.open_target(player_target('asia', account_id, 'Fixture'), query_missing=True)
+            until = time.monotonic() + 8
+            while panel.busy and time.monotonic() < until:
+                QTest.qWait(12)
+            self.assertFalse(panel.busy)
+
+        open_player('101')
+        self.assertEqual(panel.stack.currentIndex(), 1)
+        self.assertTrue(panel.radar.keys)
+        panel.tabs.setCurrentIndex(2)
+
+        open_player('102')
+        self.assertEqual(panel.profile['status'], 'private')
+        self.assertIs(panel.stack.currentWidget(), panel.hidden_account_page)
+        self.assertEqual(panel.hidden_account.title.text(), '我是隐藏🐴')
+        self.assertEqual(panel.hidden_account.identity.text(), 'Private · 亚服')
+        self.assertIsNone(panel.detail)
+        self.assertFalse(panel.radar.keys)
+        self.assertEqual(panel.ship_table.rowCount(), 0)
+        self.assertEqual(panel.tabs.currentIndex(), 0)
+        self.assertTrue(panel.refresh_button.isEnabled())
+        panel.profile_ai.set_source.assert_called_with()
+
+        open_player('103')
+        self.assertEqual(panel.profile['status'], 'not_found')
+        self.assertEqual(panel.stack.currentIndex(), 0)
+        self.assertNotIn('我是隐藏', panel.notice.text())
+
+    def test_hidden_account_lock_reads_shared_stats_into_the_current_view_only(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        link = 'https://profile.worldofwarships.asia/statistics/102/ac/fixture-code/'
+        shared = {'region': 'asia', 'account_id': '102', 'nickname': 'Private', 'modes': {'pvp': self.stats},
+                  'ships': [{'ship_id': self.sid, 'modes': {'pvp': self.stats}}], 'achievements': None}
+
+        def wait_for_query():
+            until = time.monotonic() + 8
+            while panel.busy and time.monotonic() < until:
+                QTest.qWait(12)
+            self.assertFalse(panel.busy)
+
+        def dialog_controls():
+            panel.hidden_account.lock_button.click()
+            dialog = panel.findChild(QDialog, 'sharedCareerLinkDialog')
+            field = dialog.findChild(QLineEdit, 'sharedCareerLink')
+            submit = dialog.findChild(QPushButton, 'primary')
+            return field, submit
+
+        panel.open_target(player_target('asia', '102', 'Private'), query_missing=True)
+        wait_for_query()
+        before = self.career.store.list_runs('career_snapshot')
+        with patch('wows_training.desktop.query_center_panel.load_shared_profile', return_value=shared) as load:
+            field, submit = dialog_controls()
+            self.assertEqual(field.echoMode(), QLineEdit.EchoMode.Password)
+            self.assertFalse(submit.isEnabled())
+            field.setText(link.replace('/102/', '/101/'))
+            submit.click()
+            load.assert_not_called()
+            field.setText(link)
+            submit.click()
+            wait_for_query()
+            self.assertEqual(load.call_args.args, (link, 'asia', '102'))
+        self.assertEqual(panel.shared_mode.currentData(), 'pvp')
+        self.assertEqual(panel.shared_mode_stats.item(0, 1).text(), '5')
+        self.assertEqual(panel.shared_ship_stats.rowCount(), 1)
+        self.assertFalse(panel.shared_view.isHidden())
+        self.assertEqual(panel.profile['status'], 'private')
+        self.assertEqual(self.career.store.list_runs('career_snapshot'), before)
+
+        with patch('wows_training.desktop.query_center_panel.load_shared_profile',
+                   side_effect=SharedProfileError('官方未向此链接开放战绩。')):
+            field, submit = dialog_controls()
+            field.setText(link)
+            submit.click()
+            wait_for_query()
+        self.assertIn('未向此链接开放', panel.notice.text())
+        self.assertNotIn('fixture-code', panel.notice.text())
+        panel.open_target(player_target('asia', '103', 'Another player'), query_missing=True)
+        wait_for_query()
+        self.assertIsNone(panel._shared_profile)
+        self.assertTrue(panel.shared_view.isHidden())
+
+    def test_refresh_button_fetches_only_the_current_players_regional_leaderboard(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        self.career.refresh('asia', '101')
+        feed = {'schema_version': 1, 'source': 'wows-numbers', 'mode': 'pvp', 'region': 'asia',
+                'order': 'pr_desc', 'observed_on': '2025-11-25', 'ships': {}}
+
+        def wait_for_refresh():
+            until = time.monotonic() + 8
+            while panel.busy and time.monotonic() < until:
+                QTest.qWait(12)
+            self.assertFalse(panel.busy)
+
+        with patch.object(self.career, 'numbers_transport', return_value=feed) as fetch:
+            panel.open_target(player_target('asia', '101', 'Demo101'))
+            wait_for_refresh()
+            fetch.assert_not_called()
+            panel.refresh_button.click()
+            wait_for_refresh()
+            fetch.assert_called_once()
+            self.assertEqual(fetch.call_args.args[0], 'asia')
+            self.assertIn('2025-11-25', panel.notice.text())
 
     def test_panel_cached_same_ship_and_private_clan(self):
         host=QWidget()

@@ -51,6 +51,7 @@ def glass_cap(painter,surface,cap,emphasis,rtl=False):
     plate.lineTo(outer,cap.bottom());plate.lineTo(lower,cap.bottom());plate.closeSubpath()
     wash=QLinearGradient(cap.topRight(),cap.bottomLeft())
     wash.setColorAt(0,QColor(93,166,218,round(61+62*emphasis)))
+    wash.setColorAt(.52,QColor(161,206,234,round(32+40*emphasis)))
     wash.setColorAt(1,QColor(116,164,203,round(34+29*emphasis)))
     painter.fillPath(plate,wash)
     painter.setPen(QPen(QColor(68,121,161,round(96+86*emphasis)),1.))
@@ -59,6 +60,11 @@ def glass_cap(painter,surface,cap,emphasis,rtl=False):
     direction=-1 if rtl else 1
     painter.drawLine(QPointF(lower+direction*1.8,cap.bottom()-1.4),
                      QPointF(lower+direction*(5+3*emphasis),cap.bottom()-1.4))
+    if cap.width() >= 17. and cap.height() >= 12.:
+        # A fine return edge catches the light without crossing the arrow's centre.
+        painter.setPen(QPen(QColor(255,255,255,round(113+66*emphasis)),.8))
+        painter.drawLine(QPointF(slope+direction*4.,cap.top()+2.),
+                         QPointF(outer-direction*4.,cap.top()+2.))
     painter.restore()
 
 

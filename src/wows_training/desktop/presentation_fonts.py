@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -19,6 +20,7 @@ FALLBACK_ROLES = {
 }
 MAX_BYTES = 32 * 1024 * 1024
 _CACHE = weakref.WeakKeyDictionary()
+_SANS_CACHE = weakref.WeakKeyDictionary()
 
 
 def default_font_root():
@@ -122,6 +124,29 @@ def _load(root=None):
 def load_presentation_fonts(root=None):
     """Return verified display, grade, body and technology font families after Qt setup."""
     return dict(_load(root)['roles'])
+
+
+def chinese_sans_families():
+    """Prefer the installed Chinese sans faces for long-form body text."""
+    app = QGuiApplication.instance()
+    if app in _SANS_CACHE:
+        return _SANS_CACHE[app]
+    preferred = ('SimHei', '黑体', 'Microsoft YaHei UI', 'Microsoft YaHei',
+                 'Noto Sans CJK SC', 'Source Han Sans SC', 'DengXian', 'PingFang SC')
+    families = [family for family in preferred if QFontDatabase.hasFamily(family)]
+    if not families and sys.platform == 'win32':
+        system_fonts = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'Fonts'
+        for name in ('simhei.ttf', 'msyh.ttc'):
+            path = system_fonts / name
+            if path.is_file():
+                font_id = QFontDatabase.addApplicationFont(str(path))
+                families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+                if families:
+                    break
+    choice = tuple(dict.fromkeys((*families, load_presentation_fonts()['chinese_tech'])))
+    if app is not None:
+        _SANS_CACHE[app] = choice
+    return choice
 
 
 def font_inventory(root=None):

@@ -8,6 +8,11 @@ from .career_service import _cancel, _identity
 
 
 REGION_NAMES = {'亚服': 'asia', '欧服': 'eu', '美服': 'na', '北美': 'na', 'com': 'na'}
+_DOG_TAG_PNG_LIMIT = 512 * 1024
+
+
+def _valid_dog_tag_png(png):
+    return isinstance(png, bytes) and len(png) <= _DOG_TAG_PNG_LIMIT and png.startswith(b'\x89PNG\r\n\x1a\n')
 
 
 def player_target(region, account_id, nickname):
@@ -47,6 +52,64 @@ class QueryCenter:
     @staticmethod
     def key(target):
         return target['kind'], target['region'], str(target['id'])
+
+    def cached_dog_tags(self, identities):
+        identities = {_identity(region, account_id) for region, account_id in identities}
+        if not identities:
+            return {}
+        tags = {}
+        with self.store._connection() as db:
+            for key in identities:
+                stored = db.execute('SELECT png FROM dog_tags WHERE region=? AND account_id=?', key).fetchone()
+                if stored and _valid_dog_tag_png(stored['png']):
+                    tags[key] = stored['png']
+        return tags
+
+    def save_dog_tag(self, region, account_id, png):
+        if not _valid_dog_tag_png(png):
+            raise ValueError('玩家铭牌图像格式无效')
+        region, account_id = _identity(region, account_id)
+        with self.store._connection() as db:
+            db.execute('''INSERT INTO dog_tags(region,account_id,png) VALUES (?,?,?)
+                          ON CONFLICT(region,account_id) DO UPDATE SET png=excluded.png''',
+                       (region, account_id, png))
+
+    def clear_history(self, target):
+        """Remove an identity's lookup caches and return the number of affected rows."""
+        if not isinstance(target, dict) or target.get('kind') not in ('player', 'clan'):
+            raise ValueError('查询条目类型无效')
+        region = target.get('region')
+        region, identifier = _identity(REGION_NAMES.get(region, region) if isinstance(region, str) else region,
+                                       target.get('id'))
+        with self.store._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if target['kind'] == 'clan':
+                clan_records = """SELECT id FROM runs WHERE kind='clan_lookup'
+                    AND json_extract(payload_json,'$.region')=?
+                    AND CAST(json_extract(payload_json,'$.clan_info.clan_id') AS TEXT)=?"""
+                affected = db.execute(f"""DELETE FROM runs WHERE kind='clan_lookup_fleets'
+                    AND json_extract(payload_json,'$.clan_snapshot_id') IN ({clan_records})""",
+                    (region, identifier)).rowcount
+                affected += db.execute(f'DELETE FROM runs WHERE id IN ({clan_records})',
+                                       (region, identifier)).rowcount
+            else:
+                batch_path = f'$.batch_players."{identifier}"'
+                affected = db.execute("""UPDATE runs SET payload_json=json_remove(payload_json,?)
+                    WHERE kind='clan_lookup' AND json_extract(payload_json,'$.region')=?
+                    AND json_type(payload_json,?) IS NOT NULL""", (batch_path, region, batch_path)).rowcount
+                member_path = f'$.members."{identifier}"'
+                affected += db.execute("""UPDATE runs SET payload_json=json_remove(payload_json,?)
+                    WHERE kind='clan_lookup_fleets' AND json_type(payload_json,?) IS NOT NULL
+                    AND json_extract(payload_json,'$.clan_snapshot_id') IN (
+                        SELECT id FROM runs WHERE kind='clan_lookup' AND json_extract(payload_json,'$.region')=?
+                    )""", (member_path, member_path, region)).rowcount
+                affected += db.execute("""DELETE FROM runs WHERE kind='career_snapshot'
+                    AND json_extract(payload_json,'$.region')=?
+                    AND CAST(json_extract(payload_json,'$.account_id') AS TEXT)=?""", (region, identifier)).rowcount
+                affected += db.execute('DELETE FROM dog_tags WHERE region=? AND account_id=?',
+                                       (region, identifier)).rowcount
+            db.commit()
+        return affected
 
     @staticmethod
     def clan_name(tag, name):
@@ -120,14 +183,13 @@ class QueryCenter:
     def cached_clan(self, region, clan_id):
         region, clan_id = _identity(region, clan_id)
         with self.store._connection() as db:
-            match = db.execute("""SELECT id FROM runs WHERE kind='clan_lookup'
+            match = db.execute("""SELECT id,payload_json FROM runs WHERE kind='clan_lookup'
                 AND json_extract(payload_json,'$.region')=?
                 AND json_extract(payload_json,'$.clan_info.clan_id')=?
                 ORDER BY created_at DESC,id DESC LIMIT 1""", (region, clan_id)).fetchone()
         if not match:
             return None
-        record = self.store.get_run(match['id'])
-        return dict(record['payload'], snapshot_id=record['id'])
+        return dict(json.loads(match['payload_json']), snapshot_id=match['id'])
 
     def refresh_clan(self, region, clan_id, cancel=None, progress=None):
         _cancel(cancel)

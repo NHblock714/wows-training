@@ -253,6 +253,8 @@ class FleetBackdrop(QWidget):
 
         if not self._harbor_wash.isNull():
             painter.drawImage(QPointF(190,0),self._harbor_wash)
+        if self._scene_enabled:
+            self._draw_paper_layers(painter,bounds)
 
         painter.setPen(QPen(QColor(18, 99, 211, 13), .8))
         for x in range(216, self.width(), 48):
@@ -300,6 +302,39 @@ class FleetBackdrop(QWidget):
         if self._scene_enabled and event.region().intersects(projection_area.toAlignedRect()):
             self._draw_projection(painter,projection_area)
         painter.end()
+
+    def _draw_paper_layers(self,painter,bounds):
+        field = bounds.adjusted(190,0,0,0)
+        if field.isEmpty():
+            return
+        painter.save()
+        painter.setClipRect(field,Qt.ClipOperation.IntersectClip)
+        painter.translate(field.topLeft())
+        w,h = field.width(),field.height()
+
+        edge = QPainterPath()
+        edge.addPolygon(QPolygonF([QPointF(0,h*.49),QPointF(w*.26,h*.70),
+                                   QPointF(w*.12,h),QPointF(0,h)]))
+        tint = QLinearGradient(0,h*.50,w*.24,h*.90)
+        tint.setColorAt(0,QColor(113,171,225,29))
+        tint.setColorAt(1,QColor(183,221,248,8))
+        painter.fillPath(edge,tint)
+        cap = QPainterPath()
+        cap.addPolygon(QPolygonF([QPointF(w*.51,0),QPointF(w*.70,0),
+                                  QPointF(w*.83,h*.37),QPointF(w*.72,h*.48)]))
+        tint = QLinearGradient(w*.52,0,w*.82,h*.34)
+        tint.setColorAt(0,QColor(125,185,236,20))
+        tint.setColorAt(1,QColor(154,157,225,0))
+        painter.fillPath(cap,tint)
+
+        hatched = QPainterPath()
+        hatched.addPolygon(QPolygonF([QPointF(w*.035,h*.83),QPointF(w*.18,h*.95),
+                                      QPointF(w*.14,h),QPointF(0,h)]))
+        painter.setClipPath(hatched,Qt.ClipOperation.IntersectClip)
+        painter.setPen(QPen(QColor(57,126,191,25),.85))
+        for x in range(-80,round(w*.18)+11,9):
+            painter.drawLine(QPointF(x,h),QPointF(x+h*.17,h*.83))
+        painter.restore()
 
     def _draw_registration_marks(self, painter):
         """Etched alignment marks share the margins with the moving signal trails."""
@@ -357,12 +392,22 @@ class FleetBackdrop(QWidget):
         painter.drawLine(project(.2,1),project(.46,1))
         painter.setPen(QPen(QColor(212,74,148,93),2))
         painter.drawLine(project(.86,0),project(1,.16))
+        # The two planes separate slightly as the pointer traverses the canvas.
+        reflection = QLinearGradient(project(.04,.24),project(.78,.61))
+        reflection.setColorAt(0,QColor(255,255,255,70))
+        reflection.setColorAt(.58,QColor(255,255,255,26))
+        reflection.setColorAt(1,QColor(255,255,255,0))
+        reflected = QPainterPath()
+        reflected.addPolygon(QPolygonF([project(.08,.13),project(.49,.13),project(.88,.71),project(.52,.75)]))
+        painter.fillPath(reflected,reflection)
         painter.restore()
 
 
 class FleetPageHeader(QWidget):
     def __init__(self,title,icon_key='warehouse',parent=None):
         super().__init__(parent);self.setObjectName('fleetPageHeader');self.title=str(title)
+        self.setProperty('backgroundEffect', True)
+        self._background_enabled = True
         self.setFixedHeight(66);self.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
         self._image=self._icon=None
         self._bar=default_native_ui_assets().image('header')
@@ -391,7 +436,15 @@ class FleetPageHeader(QWidget):
     def sizeHint(self):return QSize(620,66)
 
     def _shine_frame(self,value):
-        self._shine=float(value);self.update()
+        self._shine = float(value)
+        self.update(0, self.height()-39, self.width(), 27)
+
+    def set_background_enabled(self, enabled):
+        self._background_enabled = bool(enabled)
+        if not enabled:
+            self._finish_motion()
+            self._scene_offset = QPointF()
+        self.update()
 
     def _finish_motion(self):
         self._entrance.stop();self._shine=-1.;self.update()
@@ -413,15 +466,17 @@ class FleetPageHeader(QWidget):
             self._backdrop = backdrop
             if backdrop is not None:
                 backdrop.parallaxChanged.connect(self._shift_scene)
-        if backdrop is not None:
+        if backdrop is not None and self._background_enabled:
             self._scene_offset = backdrop.parallax
-        if motion_enabled(self) and not window.isMinimized():
+        if self._background_enabled and motion_enabled(self) and not window.isMinimized():
             self._entrance.stop();self._shine=0.;self._entrance.start()
 
     def hideEvent(self,event):
         self._finish_motion();super().hideEvent(event)
 
     def _shift_scene(self, offset):
+        if not self._background_enabled:
+            return
         self._scene_offset = offset
         if self.isVisible() and self.width() >= 420:
             width = min(388, int(self.width()*.35))
@@ -450,7 +505,7 @@ class FleetPageHeader(QWidget):
         painter.setClipPath(face)
 
         # Slanted scene inset: use the native harbor art at its original aspect ratio.
-        if width >= 420:
+        if self._background_enabled and width >= 420:
             scene_width = min(388, int(width*.35))
             start = width - scene_width
             inset = QPainterPath()
@@ -460,7 +515,7 @@ class FleetPageHeader(QWidget):
             inset.lineTo(start, height-1)
             inset.closeSubpath()
             painter.save()
-            painter.setClipPath(inset)
+            painter.setClipPath(inset, Qt.ClipOperation.IntersectClip)
             target = QRectF(start, 0, scene_width, height)
             painter.fillRect(target, QColor(colors.PANEL))
             if self._image is not None:
@@ -483,6 +538,18 @@ class FleetPageHeader(QWidget):
             for y in range(7, height, 7):
                 for x in range(start+4, start+58, 7):
                     painter.drawEllipse(QPointF(x, y), .8, .8)
+            # An engraved scale sits on the photographic edge, clear of the ship.
+            baseline = height - 11
+            end = width - 17
+            rule = QLinearGradient(end-92, 0, end, 0)
+            rule.setColorAt(0, QColor(211, 241, 255, 0))
+            rule.setColorAt(1, QColor(223, 248, 255, 168))
+            painter.setPen(QPen(rule, 1))
+            painter.drawLine(QPointF(end-92, baseline), QPointF(end, baseline))
+            for index in range(11):
+                x = end - 6*index
+                length = 5 if index % 5 == 0 else 2
+                painter.drawLine(QPointF(x, baseline-length), QPointF(x, baseline))
             painter.restore()
             painter.setPen(QPen(QColor(colors.CYAN), 3))
             painter.drawLine(QPointF(start+40, 1), QPointF(start-2, height-1))
@@ -502,7 +569,7 @@ class FleetPageHeader(QWidget):
         painter.fillPath(key, QColor(colors.BLUE))
         if self._bar is not None:
             painter.save()
-            painter.setClipPath(key)
+            painter.setClipPath(key, Qt.ClipOperation.IntersectClip)
             painter.setOpacity(.16)
             painter.drawImage(QRectF(0, 0, 74, height), self._bar,
                               _cover_source(self._bar, QRectF(0, 0, 74, height)))
@@ -530,7 +597,7 @@ class FleetPageHeader(QWidget):
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
         # A small routed trace bridges the white plate and the photograph.
         trace_left = max(title_left+painter.fontMetrics().horizontalAdvance(name)+30, title_end-180)
-        if width >= 420 and title_end-trace_left >= 54:
+        if self._background_enabled and width >= 420 and title_end-trace_left >= 54:
             painter.setPen(QPen(QColor(colors.LINE), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             trace = QPainterPath(QPointF(trace_left, height-18))
@@ -538,15 +605,19 @@ class FleetPageHeader(QWidget):
             trace.lineTo(title_end-12, height-36)
             trace.lineTo(title_end+15, height-36)
             painter.drawPath(trace)
-            painter.fillRect(QRectF(trace_left-2,height-20,4,4), QColor(colors.BLUE))
-        if 0 < self._shine < 1:
-            right = max(0, width*self._shine)
-            strength = round(128*math.sin(self._shine*math.pi))
-            line = QLinearGradient(right-116, 0, right, 0)
-            line.setColorAt(0, QColor(68, 219, 243, 0))
-            line.setColorAt(.82, QColor(68, 219, 243, strength))
-            line.setColorAt(1, QColor(240, 87, 166, strength))
-            painter.fillRect(QRectF(right-116, height-3, 116, 2), line)
+            painter.setPen(QPen(QColor('#688DAB'), 1))
+            painter.drawEllipse(QPointF(trace_left,height-18),2.6,2.6)
+            painter.fillRect(QRectF(trace_left-1,height-19,2,2), QColor(colors.BLUE))
+            if 0 < self._shine < 1:
+                # Light travels along the actual trace, including the diagonal join.
+                head = trace_left + (title_end+15-trace_left)*self._shine
+                strength = round(220*math.sin(self._shine*math.pi))
+                pulse = QLinearGradient(head-34, 0, head+3, 0)
+                pulse.setColorAt(0, QColor(21, 120, 183, 0))
+                pulse.setColorAt(.90, QColor(16, 132, 183, strength))
+                pulse.setColorAt(1, QColor(16, 132, 183, 0))
+                painter.setPen(QPen(pulse, 1.8))
+                painter.drawPath(trace)
         painter.end()
 
 

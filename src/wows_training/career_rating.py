@@ -97,6 +97,10 @@ def _unique_ship_rows(records):
         yield sid,row
 
 
+def ship_display_name(ship_id, official, native):
+    return native.get('display_name') or official.get('name') or native.get('internal_name') or ship_id
+
+
 def project_ships(records,mode,references,catalog=None):
     encyclopedia=references.get('encyclopedia') or {};expected=references.get('expected') or {};catalog=catalog or {}
     means=references.get('mechanical_means') or mechanical_means(encyclopedia)
@@ -109,7 +113,7 @@ def project_ships(records,mode,references,catalog=None):
             values=[normalize(value['avg_damage'],base.get('expected_damage'),.4),normalize(value['avg_frags'],base.get('expected_frags'),.1),normalize(value['win_rate'],base.get('expected_winrate'),.7)]
         pr=personal_rating(values);kind=legacy.get('type') or native.get('species');tier=legacy.get('tier',native.get('tier'))
         art=mechanical_accuracy((legacy.get('default_profile') or {}).get('artillery'))
-        result.append({'ship_id':sid,'name':native.get('display_name') or legacy.get('name') or native.get('internal_name') or sid,
+        result.append({'ship_id':sid,'name':ship_display_name(sid, legacy, native),
             'species':kind,'tier':tier,'nation':legacy.get('nation') or native.get('nation'),
             'edition':ship_edition(sid),**value,
             'pr':pr,'normalized_pr':values,'ship_battle_power':ship_power(pr,value['battles']),

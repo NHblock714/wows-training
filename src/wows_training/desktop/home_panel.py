@@ -1,10 +1,10 @@
 """Startup page for importing and reviewing World of Warships recordings."""
-from PySide6.QtCore import QPointF, QRectF, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QPointF, QRectF, QSize, QTimer, Qt, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from . import academy_palette as palette
-from .fleet_shell import navigation_icon
+from .fleet_shell import FleetBackdrop, navigation_icon
 from .layered_panel import panel_path
 from .motion import motion_enabled, subscribe_motion
 from .naval_assets import default_naval_assets
@@ -19,6 +19,8 @@ SHORTCUTS = (
     (QUERY_PAGE, "战绩查询", "查询账号与公会"),
     (3, "报告工作台", "编辑并导出报告"),
 )
+
+_SHORTCUT_INK = {0: '#276CB7', REVIEW_PAGE: '#087897', QUERY_PAGE: '#4E63A6', 3: '#755BA6'}
 
 
 def _cover(image, rect, horizontal=.62):
@@ -35,6 +37,15 @@ class _HarborHero(QWidget):
         self.setMinimumHeight(345)
         self.setMaximumHeight(625)
         self._background_enabled = True
+        self._backdrop = None
+        self._offset = QPointF()
+        self._reveal = 1.
+        self._entrance = QVariantAnimation(self)
+        self._entrance.setDuration(560)
+        self._entrance.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._entrance.setStartValue(0.)
+        self._entrance.setEndValue(1.)
+        self._entrance.valueChanged.connect(self._set_reveal)
         self._image = None
         self._wide_scene = False
         assets = default_naval_assets()
@@ -52,7 +63,51 @@ class _HarborHero(QWidget):
 
     def set_background_enabled(self, enabled):
         self._background_enabled = bool(enabled)
+        if not enabled:
+            self._settle()
         self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        subscribe_motion(self, self._motion_changed)
+        backdrop = self.window().findChild(FleetBackdrop)
+        if backdrop is not self._backdrop:
+            if self._backdrop is not None:
+                self._backdrop.parallaxChanged.disconnect(self._shift_frame)
+            self._backdrop = backdrop
+            if backdrop is not None:
+                backdrop.parallaxChanged.connect(self._shift_frame)
+        if self._background_enabled and motion_enabled(self) and not self.window().isMinimized():
+            if backdrop is not None:
+                self._offset = backdrop.parallax
+            self._set_reveal(0.)
+            self._entrance.start()
+
+    def hideEvent(self, event):
+        self._settle()
+        super().hideEvent(event)
+
+    def _settle(self):
+        self._entrance.stop()
+        self._offset = QPointF()
+        self._set_reveal(1.)
+
+    def _motion_changed(self, enabled):
+        if not enabled:
+            self._settle()
+
+    def _shift_frame(self, offset):
+        if self.isVisible() and not self.window().isMinimized() and self._background_enabled and motion_enabled(self):
+            self._offset = offset
+            self._update_corners()
+
+    def _set_reveal(self, value):
+        self._reveal = float(value)
+        self._update_corners()
+
+    def _update_corners(self):
+        self.update(0, self.height() - 76, 315, 76)
+        self.update(self.width() - 300, 0, 300, 94)
 
     @staticmethod
     def _polygon(painter, rect, points, color):
@@ -82,6 +137,7 @@ class _HarborHero(QWidget):
                 else:
                     self._paint_scene(painter, bounds)
                     self._paint_facets(painter, bounds)
+                self._paint_glass_corners(painter, bounds)
             painter.setClipping(False)
             painter.setPen(QPen(QColor("#9BBBE0"), 1.1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -91,6 +147,65 @@ class _HarborHero(QWidget):
             painter.fillRect(rail.translated(70, 0).adjusted(0, 0, -49, 0), QColor(palette.PINK))
         finally:
             painter.end()
+
+    def _paint_glass_corners(self, painter, bounds):
+        # The foreground glass floats above the fixed harbor photograph. Only
+        # the two corner strips need repainting as the shared parallax settles.
+        inset = (1. - self._reveal) * 36.
+        painter.save()
+        painter.translate(bounds.right() + inset - self._offset.x() * .8,
+                          bounds.top() - self._offset.y() * .55)
+        pane = QPainterPath()
+        pane.moveTo(-274, 0)
+        pane.lineTo(-30, 0)
+        pane.lineTo(1, 31)
+        pane.lineTo(1, 82)
+        pane.lineTo(-29, 52)
+        pane.lineTo(-83, 52)
+        pane.lineTo(-110, 25)
+        pane.lineTo(-249, 25)
+        pane.closeSubpath()
+        glass = QLinearGradient(-260, 0, 0, 60)
+        glass.setColorAt(0, QColor(228, 248, 255, 24))
+        glass.setColorAt(.65, QColor(241, 252, 255, 105))
+        glass.setColorAt(1, QColor(99, 183, 227, 85))
+        painter.fillPath(pane, glass)
+        outline = QPolygonF([QPointF(-249,25), QPointF(-110,25), QPointF(-83,52),
+                             QPointF(-29,52), QPointF(-4,77)])
+        painter.setPen(QPen(QColor(238, 253, 255, 201), 1.35))
+        painter.drawPolyline(outline)
+        painter.setPen(QPen(QColor(62, 126, 187, 125), 1))
+        painter.drawPolyline(outline.translated(1, 3))
+        painter.setPen(QPen(QColor(109, 226, 250, 204), 2.2))
+        painter.drawLine(QPointF(-79, 49), QPointF(-38, 49))
+        # Registration ticks are engraved inside the glass and move with its lip.
+        painter.setPen(QPen(QColor(53, 110, 156, 119), .9))
+        for index in range(13):
+            x = -227 + index*6
+            tick = 5 if index % 4 == 0 else 2
+            painter.drawLine(QPointF(x, 21-tick), QPointF(x, 21))
+        painter.setPen(QPen(QColor(240, 252, 255, 202), 1))
+        painter.drawLine(QPointF(-229, 22), QPointF(-151, 22))
+        painter.restore()
+
+        painter.save()
+        painter.translate(bounds.left() - inset + self._offset.x() * .65,
+                          bounds.bottom() + self._offset.y() * .55)
+        lip = QPolygonF([QPointF(0,-58), QPointF(47,-11), QPointF(177,-11),
+                         QPointF(185,-19), QPointF(270,-19), QPointF(289,0), QPointF(0,0)])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(224, 245, 255, 110))
+        painter.drawPolygon(lip)
+        painter.setPen(QPen(QColor(79, 148, 194, 122), 1))
+        painter.drawPolyline(lip.mid(0, 5))
+        painter.setPen(QPen(QColor(36, 115, 176, 125), 1.6))
+        for i in range(6):
+            x = 52 + i * 5
+            painter.drawLine(QPointF(x,-5), QPointF(x+4,-9))
+        painter.setPen(QPen(QColor(53, 118, 170, 129), 1))
+        painter.setBrush(QColor(238, 250, 255, 205))
+        painter.drawEllipse(QPointF(249, -19), 2.5, 2.5)
+        painter.restore()
 
     def _paint_wide_scene(self, painter, bounds):
         painter.drawImage(bounds, self._image, _cover(self._image, bounds, horizontal=.68))
@@ -161,10 +276,12 @@ class _HomeShortcut(QPushButton):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._hint = hint
-        self._icon = navigation_icon(page).pixmap(QSize(26, 26))
+        self._accent = QColor(_SHORTCUT_INK[page])
+        self._background_enabled = True
+        self._icon = navigation_icon(page, 26).pixmap(QSize(26, 26), 2.)
         with QPainter(self._icon) as painter:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-            painter.fillRect(self._icon.rect(), QColor("#2477C1"))
+            painter.fillRect(self._icon.rect(), self._accent)
 
     def sizeHint(self):
         return QSize(185, 91)
@@ -194,13 +311,46 @@ class _HomeShortcut(QPushButton):
 
     def paint_card_content(self, painter, box, hover):
         center_y = box.center().y()
-        painter.drawPixmap(QRectF(box.x()+15,center_y-13,26,26), self._icon, QRectF(self._icon.rect()))
-        painter.setPen(QPen(QColor("#427EB7"),1.6,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
+        compact = box.width() < 180
+        badge_size = 32 if compact else 36
+        badge = QRectF(box.x()+(7 if compact else 10), center_y-badge_size/2, badge_size, badge_size)
+        stamp = panel_path(badge, 7)
+        tint = QColor(self._accent)
+        if self._background_enabled:
+            tint.setAlpha(round(37 + 16*hover))
+            painter.fillPath(stamp.translated(0, 1.5), tint)
+            enamel = QLinearGradient(badge.topLeft(), badge.bottomRight())
+            enamel.setColorAt(0, QColor(247, 254, 255, 250))
+            enamel.setColorAt(.54, QColor(224, 241, 249, 252))
+            enamel.setColorAt(1, QColor(190, 214, 236, 246))
+            painter.fillPath(stamp, enamel)
+            painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
+            painter.drawLine(badge.topLeft()+QPointF(5, 2), badge.topRight()+QPointF(-9, 2))
+            # A small slanted index on the shoulder follows the card's existing hover.
+            tint.setAlpha(round(52 + 90*hover))
+            painter.setPen(QPen(tint, 1.2))
+            if not compact:
+                for index in range(3):
+                    x = box.right()-29 + 4*index
+                    painter.drawLine(QPointF(x, box.bottom()-7), QPointF(x+2, box.bottom()-10-2*hover))
+        else:
+            tint.setAlpha(round(14 + 15 * hover))
+            painter.fillPath(stamp, tint)
+        tint.setAlpha(round(59 + 63 * hover))
+        painter.setPen(QPen(tint, .9))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(stamp)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap(badge.adjusted(5, 5, -5, -5), self._icon, QRectF(self._icon.rect()))
+        painter.setPen(QPen(self._accent,1.6,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
         xx = box.right()-16+2*hover
-        painter.drawLine(QPointF(xx-4,center_y-4),QPointF(xx,center_y))
-        painter.drawLine(QPointF(xx,center_y),QPointF(xx-4,center_y+4))
-        x = box.left()+55
-        width = max(1,box.right()-25-x)
+        arrow_y = box.bottom()-10 if compact else center_y
+        if hover > .01:
+            painter.drawLine(QPointF(xx-2-7*hover,arrow_y), QPointF(xx-1,arrow_y))
+        painter.drawLine(QPointF(xx-4,arrow_y-4),QPointF(xx,arrow_y))
+        painter.drawLine(QPointF(xx,arrow_y),QPointF(xx-4,arrow_y+4))
+        x = badge.right() + (6 if compact else 9)
+        width = max(1,box.right()-(6 if compact else 25)-x)
         font = QFont(self.font())
         body = max(12,font.pixelSize())
         font.setPixelSize(body+3)
@@ -226,6 +376,8 @@ class HomePanel(QWidget):
         super().__init__(parent)
         self.setObjectName("homePage")
         self.setAccessibleName("首页")
+        self.setProperty("backgroundEffect", True)
+        self._background_enabled = True
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 22)
         root.setSpacing(15)
@@ -286,8 +438,64 @@ class HomePanel(QWidget):
             self.shortcuts[page] = action
         root.addLayout(shortcuts)
         root.addStretch(1)
-        root.addWidget(self._make_credit(), 0, Qt.AlignmentFlag.AlignHCenter)
+        self._credit = self._make_credit()
+        root.addWidget(self._credit, 0, Qt.AlignmentFlag.AlignHCenter)
         root.addStretch(1)
+
+    def set_background_enabled(self, enabled):
+        self._background_enabled = bool(enabled)
+        for shortcut in self.shortcuts.values():
+            shortcut._background_enabled = self._background_enabled
+            shortcut.update()
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._background_enabled:
+            return
+        # The two chart traces end before the live link. Their span follows its
+        # actual geometry, including changes in system font and display scale.
+        credit = QRectF(self._credit.geometry())
+        y = credit.center().y()
+        if event.rect().bottom() < y-48 or event.rect().top() > y+48:
+            return
+        room = min(y - max(card.geometry().bottom() for card in self.shortcuts.values()),
+                   self.height() - y)
+        if room < 18:
+            return
+        depth = min(38., room * .40)
+        with QPainter(self) as painter:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for origin, direction, end, ink in (
+                (24., 1., credit.left()-18, '#419AC8'),
+                (self.width()-24., -1., credit.right()+18, '#8983C1'),
+            ):
+                length = (end-origin) * direction
+                if length < 84:
+                    continue
+                painter.save()
+                painter.translate(origin, y)
+                painter.scale(direction, direction)
+                knee = length * .54
+                edge = QPolygonF([QPointF(0,depth), QPointF(knee-depth,depth),
+                                  QPointF(knee,0), QPointF(length,0)])
+                lower = QPolygonF([QPointF(length-16,6), QPointF(knee+4,6),
+                                   QPointF(knee-depth+4,depth+5), QPointF(0,depth+5)])
+                wash = QLinearGradient(0, 0, length, 0)
+                accent = QColor(ink)
+                for stop, alpha in ((0, 0), (.42, 31), (1, 76)):
+                    accent.setAlpha(alpha)
+                    wash.setColorAt(stop, accent)
+                painter.setBrush(wash)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawPolygon(edge + lower)
+                painter.setPen(QPen(wash, 1))
+                painter.drawPolyline(edge)
+                painter.setPen(QPen(QColor(ink), 1.3))
+                for i in range(3):
+                    x = length-13+i*5
+                    painter.drawLine(QPointF(x,-2), QPointF(x+2,-5))
+                painter.restore()
 
     def showEvent(self, event):
         super().showEvent(event)

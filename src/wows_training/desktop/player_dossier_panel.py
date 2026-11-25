@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView,QCheckBox,QComboBox,QDialog,QDi
 
 from .multiview_panel import RecordingJob
 from .naval_widgets import ShipArtwork
+from .career_rating_visuals import install_rating_delegate, rating_accent, rating_ink, set_rating_halo, style_rating_item
 from .chart_motion import ChartReveal
 from .layered_panel import LayeredPanel
 from . import academy_palette as tone
@@ -55,6 +56,12 @@ def count_text(value):return f'{value:,.0f}' if number(value) else '—'
 
 
 def percent(value):return f'{value:.1%}' if number(value) and value<=1 else '—'
+
+
+def _style_rating_value(label, pr):
+    accent = rating_accent(pr)
+    label.setStyleSheet(f'color:{rating_ink(accent).name()};font-size:15px;font-weight:600;')
+    set_rating_halo(label, accent)
 
 
 def plain(text='',name=None):
@@ -281,7 +288,8 @@ class PlayerDossierPanel(QWidget):
         self.tabs.addTab(overview,'概览')
         ships=QWidget();ships_layout=QVBoxLayout(ships);self.ship_note=plain('同舰对照 · 两侧样本独立');ships_layout.addWidget(self.ship_note)
         self.ship_table=grid(['舰船','REP 出场','REP 胜率','REP 承伤均值','公开场次','公开胜率','公开场均输出','PR'],'dossierShips')
-        for column,width in enumerate((190,80,90,105,90,90,115,80)):self.ship_table.setColumnWidth(column,width)
+        install_rating_delegate(self.ship_table, 7)
+        for column,width in enumerate((190,80,90,105,90,90,115,96)):self.ship_table.setColumnWidth(column,width)
         self.ship_table.itemSelectionChanged.connect(self._table_ship_selected);ships_layout.addWidget(self.ship_table);self.tabs.addTab(ships,'用舰档案')
         matches=QWidget();match_layout=QVBoxLayout(matches);self.match_caption=plain('暂无比赛记录');match_layout.addWidget(self.match_caption)
         self.match_table=grid(['日期 / 地图','赛事赛号','舰船','赛果','实际承伤','结算字段'],'dossierMatches');self.match_table.itemDoubleClicked.connect(lambda _:self.open_match())
@@ -626,6 +634,8 @@ class PlayerDossierPanel(QWidget):
         self.public_ledger.update_values({'battles':count_text(shown_pub.get('battles')),'win_rate':percent(shown_pub.get('win_rate')),
             'damage':count_text(shown_pub.get('avg_damage')),'frags':f'{shown_pub["avg_frags"]:.2f}' if number(shown_pub.get('avg_frags')) else '—',
             'survival':percent(shown_pub.get('survival_rate')),'pr':count_text(pr),'power':count_text(power)},public_caption)
+        _style_rating_value(self.public_ledger.values['pr'], pr)
+        _style_rating_value(self.public_ledger.values['power'], pr if number(power) else None)
         self.public_ledger.values['power'].setToolTip('公开战绩评分')
         if rating:
             baseline=(rating.get('baseline') or {}).get('expected_reference') or {}
@@ -653,7 +663,11 @@ class PlayerDossierPanel(QWidget):
             values.append([a.get('ship_name') or b.get('name') or key,f'{a.get("appearances",0)}/{(self.rep_profile or {}).get("appearances",0)}' if self.rep_profile else None,
                 percent(a.get('win_rate')),count_text((a.get('damage') or {}).get('confirmed_match_mean')),
                 count_text(b.get('battles')),percent(b.get('win_rate')),count_text(b.get('avg_damage')),count_text(b.get('pr'))])
-        self.ship_table.blockSignals(True);fill(self.ship_table,values,self._ship_rows);self.ship_table.blockSignals(False)
+        self.ship_table.blockSignals(True)
+        fill(self.ship_table,values,self._ship_rows)
+        for row, key in enumerate(self._ship_rows):
+            style_rating_item(self.ship_table.item(row, 7), pub.get(key, {}).get('pr'))
+        self.ship_table.blockSignals(False)
         for col in (1,2,3):self.ship_table.setColumnHidden(col,self.rep_profile is None)
         for col in (4,5,6,7):self.ship_table.setColumnHidden(col,self.public_profile is None or self.public_profile.get('status') not in ('ok','partial','no_battles'))
         self.ship_note.setText(f'同舰对照 · {len(self._ship_rows)} 种舰船 · 两侧场次与模式各自独立')
