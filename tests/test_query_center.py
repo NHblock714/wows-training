@@ -17,6 +17,7 @@ from PySide6.QtCore import QBuffer, QIODevice, QPoint, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from wows_training.career_service import CareerService
+from wows_training.desktop.motion import MotionController
 from wows_training.desktop.query_center_panel import QueryCenterPanel
 from wows_training.desktop.query_visuals import RatingRadar,RadarFocusOverlay,snapshot_card
 from wows_training.query_center import QueryCenter, player_target
@@ -90,6 +91,78 @@ class Queries(unittest.TestCase):
         self.assertFalse(self.calls)
         rows=self.service.search('asia','Demo')['candidates']
         self.assertEqual([r['kind'] for r in rows],['player','clan'])
+
+    def test_read_progress_tracks_search_and_respects_reduced_motion(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        motion = MotionController(host)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        QVBoxLayout(host).addWidget(panel)
+        host.show()
+        panel.text.setText('Demo')
+
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                self.failure = failure
+                release = threading.Event()
+
+                def waiting_transport(*args):
+                    if not release.wait(3):
+                        raise TimeoutError('test transport held too long')
+                    return self.transport(*args)
+
+                self.career.transport = waiting_transport
+                motion.set_enabled(True, persist=False)
+                panel.search()
+                try:
+                    self.assertFalse(panel.read_progress.isHidden())
+                    self.assertEqual(panel.read_progress.maximum(), 0)
+                    self.assertIn('搜索公开资料', panel.read_progress.accessibleDescription())
+                    motion.set_enabled(False, persist=False)
+                    self.assertGreater(panel.read_progress.maximum(), 0)
+                    self.assertEqual(panel.read_progress.value(), 0)
+                finally:
+                    release.set()
+                    if panel.job is not None:
+                        panel.job.wait(3000)
+                    QTest.qWait(20)
+                self.assertFalse(panel.busy)
+                self.assertTrue(panel.read_progress.isHidden())
+                self.assertIn('0 个候选' if failure else '2 个候选', panel.notice.text())
+
+    def test_read_progress_counts_earlier_members_and_ignores_updates_after_cancel(self):
+        host = QWidget()
+        self.addCleanup(host.close)
+        panel = QueryCenterPanel(host)
+        panel._service = self.service
+        panel.clan = self.service.refresh_clan('asia', '111')
+        release = threading.Event()
+
+        def waiting_member_lookup(_clan, _cancel, progress):
+            progress('读取成员船仓 2/3 · 示例')
+            release.wait(3)
+            progress('读取成员船仓 3/3 · 示例')
+            return {}
+
+        with patch.object(self.service, 'load_member_ships', side_effect=waiting_member_lookup):
+            panel.fetch_fleets()
+            try:
+                deadline = time.monotonic() + 2
+                while panel.read_progress.maximum() != 3 and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertEqual(panel.read_progress.maximum(), 3)
+                self.assertEqual(panel.read_progress.value(), 1)
+                panel.cancel()
+                self.assertTrue(panel.read_progress.isHidden())
+            finally:
+                release.set()
+                if panel.job is not None:
+                    panel.job.wait(3000)
+                QTest.qWait(20)
+        self.assertFalse(panel.busy)
+        self.assertTrue(panel.read_progress.isHidden())
+        self.assertEqual(panel.notice.text(), '查询已取消')
 
     def test_bookmark_import_is_atomic_and_preserves_regions(self):
         path=Path(self.folder.name)/'quick_queries.json'

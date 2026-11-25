@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import math
+import re
 
 from PySide6.QtCore import QEvent, QEasingCurve, QPointF, QRectF, QSignalBlocker, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QHoverEvent, QLinearGradient, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QSpacerItem, QVBoxLayout, QWidget,
+    QBoxLayout, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSpacerItem, QVBoxLayout, QWidget,
 )
 
 from ..f1_ratings.challenges import CHALLENGES
@@ -66,6 +67,21 @@ def _label(text="", *, pixels=None, family=None, color=tone.INK, bold=False):
         style += "font-weight:600;"
     label.setStyleSheet(style)
     return label
+
+
+def _detail_section(title, body, accent, family, *, panel_alpha=110):
+    section = QFrame()
+    section.setObjectName("achievementDetailSection")
+    section.setStyleSheet(
+        f"QFrame#achievementDetailSection {{background:rgba(255,255,255,{panel_alpha});"
+        f"border-left:2px solid {accent};border-radius:3px;}}"
+    )
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(14, 10, 14, 12)
+    layout.setSpacing(5)
+    layout.addWidget(_label(title, pixels=12, family=family, color=accent, bold=True))
+    layout.addWidget(body)
+    return section
 
 
 def _group_label(group):
@@ -271,7 +287,7 @@ class _MedalIcon(QWidget):
 
 class _MedalCard(LayeredPanel):
     DETAIL_INK = "#2A4056"
-    CLOSED_MIN_HEIGHT = 133
+    CLOSED_MIN_HEIGHT = 104
     expansionRequested = Signal()
 
     def __init__(self, entry, font_family):
@@ -313,7 +329,8 @@ class _MedalCard(LayeredPanel):
         self._detail_animation.finished.connect(self._settle_details)
         box = QVBoxLayout(self)
         self._position_content()
-        box.setSpacing(4)
+        box.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        box.setSpacing(0)
         row = QHBoxLayout()
         row.setSpacing(10)
         self.medal = _MedalIcon(style, group)
@@ -325,57 +342,76 @@ class _MedalCard(LayeredPanel):
         tags.addWidget(RarityWordmark(style), 0, Qt.AlignmentFlag.AlignVCenter)
         tags.addWidget(_label(_group_label(group), pixels=12, color=self.DETAIL_INK), 1)
         words.addLayout(tags)
-        header = _label(name, pixels=19, family=font_family, bold=True)
-        words.addWidget(header)
+        fonts = load_presentation_fonts()
+        self._preview_title = _label(name, pixels=20, family=font_family, bold=True)
+        self._preview_title.setObjectName("achievementPreviewTitle")
+        title_family = fonts["display"] if name.isascii() else fonts["chinese_tech"]
+        detail_name = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[_-])", "\u200b", name) if name.isascii() else name
+        self._detail_title = _label(detail_name, pixels=29, family=title_family, bold=True)
+        self._detail_title.setAccessibleName(name)
+        self._detail_title.setObjectName("achievementDetailTitle")
+        self._detail_title.hide()
+        words.addWidget(self._preview_title)
+        words.addWidget(self._detail_title)
         row.addLayout(words, 1)
         box.addLayout(row)
-        # The bundled Chinese faces omit the mathematical comparison signs.
-        measure_fonts = ("Microsoft YaHei UI", load_presentation_fonts()["tech"], font_family)
         rule = str(entry.get("requirement") or "")
-        if rule:
-            box.addWidget(_label(rule, pixels=13, family=measure_fonts, color=self.DETAIL_INK))
-        self._summary_gap = QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
-        box.addSpacerItem(self._summary_gap)
         ship_match = entry.get("id") == "ship_damage_114514"
         value = "、".join(entry.get("matched_ships") or ()) if ship_match else _measure(entry)
-        if value:
-            measure = _label(value, pixels=17, family=measure_fonts, bold=True)
-            if ship_match:
-                measure.setObjectName("achievementMatchedShips")
-                measure.setAccessibleName(f"达标战舰 {value}")
-            box.addWidget(measure)
         self._summary = (rule, value)
         self._detail_pane = QWidget(self)
         detail_box = QVBoxLayout(self._detail_pane)
-        detail_box.setContentsMargins(0, 14, 0, 4)
-        detail_box.setSpacing(0)
-        self.description = _label(str(entry.get("description") or ""), pixels=18,
-                                  family=chinese_sans_families(), color="#161C25")
+        detail_box.setContentsMargins(0, 15, 0, 4)
+        detail_box.setSpacing(12)
+        detail_fonts = chinese_sans_families()
+        self._detail_facts = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self._detail_facts.setSpacing(12)
+        if rule:
+            condition = _label(rule, pixels=16, family=detail_fonts, color=self.DETAIL_INK)
+            condition.setObjectName("achievementRequirement")
+            self._detail_facts.addWidget(_detail_section("达成条件", condition, style.ink, detail_fonts), 3)
+        if value:
+            result = _label(value, pixels=23, family=(fonts["tech"], *detail_fonts), bold=True, color=style.ink)
+            label = "达标战舰" if ship_match else "达成记录"
+            result.setObjectName("achievementDetailedValue")
+            result.setAccessibleName(label)
+            self._detail_facts.addWidget(_detail_section(label, result, style.ink, detail_fonts), 2)
+        if self._detail_facts.count():
+            detail_box.addLayout(self._detail_facts)
+        speech = str(entry.get("description") or "")
+        speech_font = fonts["grade"] if speech.isascii() else fonts["chinese_display"]
+        self.description = _label(speech, pixels=21, family=(speech_font, *detail_fonts), color="#161C25")
         self.description.setObjectName("achievementDescription")
         self.description.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        detail_box.addWidget(self.description)
+        if self.description.text():
+            detail_box.addWidget(_detail_section("成就致辞", self.description, style.ink, detail_fonts, panel_alpha=62))
+        else:
+            self.description.setParent(self._detail_pane)
+            self.description.hide()
         self._detail_pane.hide()
         box.addWidget(self._detail_pane)
         self._update_accessibility()
 
     def _update_accessibility(self):
-        self.setAccessibleName(f"{self._caption} · {'已展开' if self._expanded else '展开描述'}")
-        description = self.description.text() if self._expanded else "按回车键或空格键展开描述"
-        self.setAccessibleDescription("。".join(value for value in (*self._summary, description) if value))
+        self.setAccessibleName(f"{self._caption} · {'已展开' if self._expanded else '展开详情'}")
+        rule, value = self._summary
+        details = (rule, value, self.description.text()) if self._expanded else ("按回车键或空格键展开详情",)
+        self.setAccessibleDescription("。".join(text for text in details if text))
 
     def set_expanded(self, expanded, *, animate=True):
         if self._expanded == expanded:
             return
         self._detail_animation.stop()
         self._expanded = expanded
-        self._summary_gap.changeSize(0, 0, QSizePolicy.Policy.Minimum,
-                                     QSizePolicy.Policy.Fixed if expanded else QSizePolicy.Policy.Expanding)
+        self._preview_title.setVisible(not expanded)
+        self._detail_title.setVisible(expanded)
+        self.layout().setAlignment(Qt.AlignmentFlag.AlignTop if expanded else Qt.AlignmentFlag.AlignVCenter)
         self._position_content()
         self.layout().invalidate()
         self._update_accessibility()
         if expanded:
             self._detail_base_height = max(self.CLOSED_MIN_HEIGHT, self.height())
-            self._detail_pane.setVisible(bool(self.description.text()))
+            self._detail_pane.setVisible(bool(self._detail_pane.layout().count()))
             if animate and motion_enabled(self) and not self.window().isMinimized():
                 self._detail_frame(0.)
                 self._detail_animation.start()
@@ -395,10 +431,10 @@ class _MedalCard(LayeredPanel):
                                         * self._detail_progress))
             margins = self.layout().contentsMargins()
             available = max(1, self.width() - margins.left() - margins.right())
-            body_height = self.description.heightForWidth(available)
+            body_height = self._detail_pane.layout().totalHeightForWidth(available)
             if body_height <= 0:
-                body_height = self.description.sizeHint().height()
-            self._detail_pane.setMaximumHeight(round((body_height + 18) * self._detail_progress))
+                body_height = self._detail_pane.sizeHint().height()
+            self._detail_pane.setMaximumHeight(round(body_height * self._detail_progress))
         self.update()
 
     def _settle_details(self):
@@ -447,7 +483,13 @@ class _MedalCard(LayeredPanel):
         # Keep the total inset constant so the grid and the hit target stay still.
         lift = round((1 + self.rarity.rank) * self.hover_progress)
         if self._expanded:
-            self.layout().setContentsMargins(28, 26, max(42, round(expanded_art_width(self.width()))), 26)
+            left, right = 28, max(42, round(expanded_art_width(self.width())))
+            self.layout().setContentsMargins(left, 26, right, 26)
+            available = self.width() - left - right
+            direction = (QBoxLayout.Direction.LeftToRight if available >= 455 and self._detail_facts.count() == 2
+                         else QBoxLayout.Direction.TopToBottom)
+            if self._detail_facts.direction() != direction:
+                self._detail_facts.setDirection(direction)
         else:
             self.layout().setContentsMargins(18, 13 - lift, 24, 17 + lift)
 

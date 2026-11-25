@@ -1,10 +1,11 @@
 """Account and clan lookup, ship comparisons and public battle cards."""
 from __future__ import annotations
+import re
 from sqlite3 import Error as StorageError
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView,
-    QFrame, QGridLayout, QLineEdit, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTabWidget, QTableWidget,
+    QFrame, QGridLayout, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..career_rating import metrics, project_ships
@@ -12,6 +13,7 @@ from ..dog_tags import fetch_dog_tag
 from ..query_center import QueryCenter, player_target
 from ..shared_profile import SharedProfileError, load_shared_profile, parse_share_link
 from .fleet_shell import FleetPageHeader
+from .motion import motion_enabled, subscribe_motion
 from .multiview_panel import RecordingJob
 from .player_dossier_panel import CLASS_NAMES, MODES, REGIONS, count_text, percent, query_status, time_text
 from .query_visuals import CareerDistribution, RadarFocusOverlay, RatingRadar, SnapshotCardDialog, axis_title, plain_label
@@ -46,6 +48,7 @@ MEMBER_STATUS = {'ok':'公开','unknown':'资料未知','private':'隐藏','no_b
                  'not_fetched':'未载入','no_matches':'范围内无场次','error':'查询失败'}
 GRADE_BANDS = ((100,'S','#805611'),(70,'A','#783C94'),(40,'B','#215C94'),
                (10,'C','#276644'),(0,'D','#A23550'))
+_MEMBER_PROGRESS = re.compile(r'^(?:读取|整理)成员船仓 ([0-9]+)/([0-9]+)(?: · .*)?$')
 
 
 def member_grade(value):
@@ -139,6 +142,7 @@ class QueryCenterPanel(QWidget):
         self.peer = None
         self._picker_context = None
         self._loading = False
+        self._progress_step = None
         self.profile_ai = None
         self._build()
 
@@ -201,10 +205,25 @@ class QueryCenterPanel(QWidget):
         for signal in (self.region.currentIndexChanged,self.kind.currentIndexChanged,self.text.textChanged):
             signal.connect(self._clear_candidates)
         status_row = QHBoxLayout()
+        status_track = QVBoxLayout()
+        status_track.setSpacing(4)
         self.notice = plain_label()
         self.notice.hide()
+        status_track.addWidget(self.notice)
+        self.read_progress = QProgressBar()
+        self.read_progress.setObjectName('queryReadProgress')
+        self.read_progress.setAccessibleName('战绩查询读取进度')
+        self.read_progress.setTextVisible(False)
+        self.read_progress.setFixedHeight(6)
+        self.read_progress.setStyleSheet(
+            'QProgressBar#queryReadProgress {border-image:none;background:#D9E7F6;border:0;border-radius:3px;}'
+            'QProgressBar#queryReadProgress::chunk {border-image:none;border:0;border-radius:3px;'
+            'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #226BC3,stop:.82 #57A4E5,stop:1 #BA81BE);}')
+        self.read_progress.hide()
+        status_track.addWidget(self.read_progress)
+        subscribe_motion(self, self._update_read_progress)
         self.cancel_button = button('取消查询',self.cancel); self.cancel_button.hide()
-        status_row.addWidget(self.notice,1); status_row.addWidget(self.cancel_button)
+        status_row.addLayout(status_track, 1); status_row.addWidget(self.cancel_button)
         outer.addLayout(status_row)
         self.stack = QStackedWidget(); outer.addWidget(self.stack,1)
         self.favorites_page = QueryFavorites()
@@ -662,13 +681,41 @@ class QueryCenterPanel(QWidget):
         job = RecordingJob(operation, self)
         self.job = job
         self.inputs.setEnabled(False); self.stack.setEnabled(False)
-        self.cancel_button.show(); self.cancel_button.setEnabled(True); self._say(message)
-        job.progress.connect(self._say)
+        self.cancel_button.show(); self.cancel_button.setEnabled(True)
+        self._job_progress(message)
+        self.read_progress.show()
+        job.progress.connect(self._job_progress)
         self._accept_result = success
         job.succeeded.connect(self._delivered)
         job.failed.connect(self._failed)
         job.finished.connect(self._finished)
         job.start()
+
+    @Slot(str)
+    def _job_progress(self, message):
+        if self.job is None or self.job.cancel_event.is_set():
+            return
+        stage = _MEMBER_PROGRESS.fullmatch(message)
+        self._progress_step = None
+        if stage:
+            index, total = map(int, stage.groups())
+            if 1 <= index <= total:
+                # The callback starts the current member; only earlier members are processed.
+                self._progress_step = (index - 1, total)
+        self._update_read_progress(motion_enabled(self))
+        self.read_progress.setAccessibleDescription(message)
+        self._say(message)
+
+    def _update_read_progress(self, animated):
+        if self.job is None or self.job.cancel_event.is_set():
+            return
+        if self._progress_step is not None:
+            completed, total = self._progress_step
+            self.read_progress.setRange(0, total)
+            self.read_progress.setValue(completed)
+        else:
+            self.read_progress.setRange(0, 0 if animated else 1)
+            self.read_progress.setValue(0)
 
     @Slot(object)
     def _delivered(self,result):
@@ -686,6 +733,8 @@ class QueryCenterPanel(QWidget):
     def _finished(self):
         job, self.job = self.job, None
         self._accept_result = None
+        self._progress_step = None
+        self.read_progress.hide()
         self.inputs.setEnabled(True); self.stack.setEnabled(True); self.cancel_button.hide()
         if job:
             job.deleteLater()
@@ -695,7 +744,8 @@ class QueryCenterPanel(QWidget):
         if self.profile_ai is not None and self.profile_ai.busy:
             self.profile_ai.cancel()
         if self.job:
-            self.job.cancel_event.set(); self.cancel_button.setEnabled(False); self._say('查询已取消')
+            self.job.cancel_event.set(); self.cancel_button.setEnabled(False)
+            self.read_progress.hide(); self._say('查询已取消')
 
     def search(self):
         region, text, kind = self.region.currentData(), self.text.text().strip(), self.kind.currentData()

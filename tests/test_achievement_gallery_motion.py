@@ -10,13 +10,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, Qt
 from PySide6.QtGui import QTextLayout
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from wows_training.desktop.achievement_gallery import AchievementGallery, earned_achievements
 from wows_training.desktop.achievement_rarity import rarity_style
 from wows_training.desktop.achievement_wordmark import RarityWordmark
 from wows_training.desktop.motion import MotionController
-from wows_training.desktop.presentation_fonts import chinese_sans_families
+from wows_training.desktop.presentation_fonts import load_presentation_fonts
 from wows_training.f1_ratings.challenges import CHALLENGES
 
 
@@ -127,9 +127,11 @@ class AchievementGalleryMotionTests(unittest.TestCase):
                 wordmark = card.findChild(RarityWordmark)
                 self.assertEqual(wordmark.text(), english[rank])
                 self.assertTrue(card.rect().contains(wordmark.mapTo(card, wordmark.rect().bottomRight())))
-                measure = next(label for label in card.findChildren(QLabel)
-                               if label.text() == ("≤ 88" if rank % 2 else "≥ 88"))
-                rule = next(label for label in card.findChildren(QLabel) if label.text().startswith("3 ≤"))
+                title = card.findChild(QLabel, "achievementPreviewTitle")
+                measure = card.findChild(QLabel, "achievementDetailedValue")
+                rule = card.findChild(QLabel, "achievementRequirement")
+                self.assertEqual(measure.text(), "≤ 88" if rank % 2 else "≥ 88")
+                self.assertFalse(rule.isVisible() or measure.isVisible())
                 for label in (rule, measure):
                     text_layout = QTextLayout(label.text(), label.font())
                     text_layout.beginLayout()
@@ -140,11 +142,11 @@ class AchievementGalleryMotionTests(unittest.TestCase):
                         self.assertNotIn(0, run.glyphIndexes(), label.text())
                 resting = card.grab().toImage()
                 geometry = card.geometry()
-                origin = measure.mapTo(card, QPoint())
+                origin = title.mapTo(card, QPoint())
                 card._frame(1.)
                 self.app.processEvents()
                 self.assertEqual(card.geometry(), geometry)
-                self.assertEqual(origin.y() - measure.mapTo(card, QPoint()).y(), rank + 1)
+                self.assertEqual(origin.y() - title.mapTo(card, QPoint()).y(), rank + 1)
                 self.assertNotEqual(card.grab().toImage(), resting)
                 self.assertEqual(card.medal.progress, 1.)
                 card._finish()
@@ -168,7 +170,9 @@ class AchievementGalleryMotionTests(unittest.TestCase):
         self.assertGreater(self.card.height(), old_height)
         self.assertGreater(self.neighbor.y(), old_y)
         self.assertEqual(self.card.description.text(), "会战兵力是11舰对4舰，优势在我")
-        self.assertIn(chinese_sans_families()[0], self.card.description.styleSheet())
+        self.assertIn(load_presentation_fonts()["chinese_display"], self.card.description.styleSheet())
+        self.assertTrue(any(label.text() == "成就致辞" and label.isVisible()
+                            for label in self.card.findChildren(QLabel)))
         self.assertTrue(self.card.description.isVisible())
         self.assertFalse(self.neighbor._expanded)
 
@@ -181,6 +185,34 @@ class AchievementGalleryMotionTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.neighbor._expanded)
         self.assertEqual(self.card.y(), self.neighbor.y())
+
+    def test_preview_hides_requirements_and_measurements_until_detail_reflows(self):
+        self.window.resize(1120, 670)
+        self.motion.set_enabled(False, persist=False)
+        self.gallery.set_detail({"achievement_gallery": [
+            {"id": "battle_damage", "name": "创造模式", "status": "earned", "value": 403631, "unit": "点",
+             "requirement": "随机战最高单场造成伤害 ≥ 400,000 点", "description": "我说终于赢了，你说真刷爽了"},
+        ]}, ("asia", "compact-details"))
+        self.app.processEvents()
+        card = self.gallery._cards[0][1]
+        rule = card.findChild(QLabel, "achievementRequirement")
+        result = card.findChild(QLabel, "achievementDetailedValue")
+        self.assertEqual(result.text(), "403,631点")
+        self.assertFalse(rule.isVisible() or result.isVisible())
+        self.assertNotIn("400,000", card.accessibleDescription())
+        self.assertNotIn("403,631", card.accessibleDescription())
+        QTest.keyClick(card, Qt.Key.Key_Return)
+        self.app.processEvents()
+        self.assertTrue(rule.isVisible() and result.isVisible() and card.description.isVisible())
+        self.assertEqual(card._detail_facts.direction(), QBoxLayout.Direction.LeftToRight)
+        self.assertIn("400,000", card.accessibleDescription())
+        self.window.resize(420, 620)
+        self.app.processEvents()
+        self.assertEqual(card._detail_facts.direction(), QBoxLayout.Direction.TopToBottom)
+        self.assertGreater(result.mapTo(card, QPoint()).y(), rule.mapTo(card, QPoint()).y())
+        QTest.keyClick(card, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(rule.isVisible() or result.isVisible())
 
     def test_expansion_respects_motion_preference_and_category_changes(self):
         self.motion.set_enabled(False, persist=False)
@@ -205,11 +237,13 @@ class AchievementGalleryMotionTests(unittest.TestCase):
         self.gallery.set_detail({"achievement_gallery": [row, comparison]}, ("asia", "ship-match"))
         self.app.processEvents()
         card, other = [card for _, card in self.gallery._cards]
-        label = card.findChild(QLabel, "achievementMatchedShips")
-        numeric = next(label for label in other.findChildren(QLabel) if label.text().startswith("7"))
+        label = card.findChild(QLabel, "achievementDetailedValue")
+        numeric = other.findChild(QLabel, "achievementDetailedValue")
         self.assertEqual(label.text(), "玛索、得梅因")
-        self.assertEqual(label.styleSheet(), numeric.styleSheet())
+        self.assertEqual(label.font(), numeric.font())
         self.assertFalse(any(label.text().replace(" ", "") == "114,514点" for label in card.findChildren(QLabel)))
+        self.assertNotIn("玛索、得梅因", card.accessibleDescription())
+        QTest.keyClick(card, Qt.Key.Key_Return)
         self.assertIn("玛索、得梅因", card.accessibleDescription())
         self.assertEqual(card.rarity.label, "传奇")
 
@@ -245,7 +279,7 @@ class AchievementGalleryMotionTests(unittest.TestCase):
         self.assertFalse(card._background_enabled)
         card._frame(1.)
         self.app.processEvents()
-        label = next(label for label in card.findChildren(QLabel) if label.text() == "≤ 100")
+        label = card.findChild(QLabel, "achievementPreviewTitle")
         plain, text = card.grab().toImage(), label.grab().toImage()
         card.set_background_enabled(True)
         self.assertNotEqual(card.grab().toImage(), plain)
