@@ -18,6 +18,7 @@ class _Evidence:
     fleet_complete: bool
     awards: dict | None
     solo: dict | None
+    solo_fleet: dict | None
     created_at: int | None
     as_of: str | None
     region: str | None
@@ -175,6 +176,33 @@ def _named_ship(ship_id, metric="battles"):
         else:
             value = _value(stats, metric)
         return value, value is not None
+    return measure
+
+
+def _ship_solo_share(ship_id):
+    total_battles = _named_ship(ship_id)
+
+    def measure(evidence):
+        total, complete = total_battles(evidence)
+        if not total:
+            return None, complete
+        fleet = evidence.solo_fleet or {}
+        if fleet.get("status") == "no_battles":
+            return 0, True
+        rows = fleet.get("ships")
+        if fleet.get("status") != "ok" or not isinstance(rows, list):
+            return None, False
+        matches = [row for row in rows if isinstance(row, dict) and str(row.get("ship_id")) == ship_id]
+        if len(matches) == 1:
+            solo = _value(matches[0], "statistics", "battles")
+            return (100 * solo / total, True) if type(solo) is int and solo <= total else (None, False)
+        if not matches:
+            # Absence is a known zero only when the solo fleet accounts for all recorded solo battles.
+            counts = [_value(row, "statistics", "battles") for row in rows]
+            if all(type(count) is int for count in counts) and sum(counts) == _value(evidence.solo, "battles"):
+                return 0, True
+        return None, False
+
     return measure
 
 
@@ -374,6 +402,8 @@ CHALLENGES = (
     _challenge("high_tier_submarines_all", 10, "场", _roster("submarine", every=True)),
     _challenge("essex_scouting", 200_000, "点",
                _requires(_named_ship(_ESSEX, "avg_scouting"),
+                         _at_least(_named_ship(_ESSEX), 40),
+                         _at_least(_ship_solo_share(_ESSEX), 50),
                          (_named_ship(_ESSEX, "avg_damage"), 120_000, "at_most"))),
     _challenge("incomparable_69", 180_000, "点",
                _requires(_named_ship(_INCOMPARABLE, "max_damage_dealt"), _at_least(_named_ship(_INCOMPARABLE), 69))),
@@ -427,11 +457,11 @@ def _fleet_records(fleet, account, encyclopedia, local_catalog):
 
 
 def evaluate_challenges(account, fleet, achievements=None, *, encyclopedia=None, local_catalog=None,
-                        solo=None, created_at=None, as_of=None, region=None, numbers_rankings=None):
+                        solo=None, solo_fleet=None, created_at=None, as_of=None, region=None, numbers_rankings=None):
     """Return rules and series totals from the same set of played ships."""
     active, fleet_complete = _fleet_records(fleet, account, encyclopedia or {}, local_catalog or {})
     evidence = _Evidence(account, active, fleet_complete, normalize_battle_achievements(achievements),
-                         solo, created_at, as_of, region, numbers_rankings)
+                         solo, solo_fleet, created_at, as_of, region, numbers_rankings)
     report = []
     for challenge in CHALLENGES:
         value, complete, *details = challenge.measure(evidence)

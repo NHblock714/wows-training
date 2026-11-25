@@ -132,6 +132,34 @@ class AccountAchievementTests(unittest.TestCase):
         rows,_ = evaluate_challenges({"battles":sum(s["statistics"]["battles"] for s in fleet["ships"])},fleet)
         self.assertEqual(next(r for r in rows if r["id"]=="credit_ship_trio")["status"],"pending")
 
+    def test_essex_achievement_uses_its_own_random_battles_and_solo_share(self):
+        essex = "4273977328"
+        other = "4273977329"
+
+        def status(battles, solo_ships, solo_battles):
+            total_fleet = {"status": "ok", "ships": [
+                _ship(essex, battles, damage_dealt=120_000 * battles, damage_scouting=200_000 * battles),
+                _ship(other, 95),
+            ]}
+            solo_fleet = None if solo_ships is None else {"status": "ok", "ships": solo_ships}
+            rows, _ = evaluate_challenges({"battles": battles + 95}, total_fleet,
+                                           solo={"battles": solo_battles}, solo_fleet=solo_fleet)
+            return next(row["status"] for row in rows if row["id"] == "essex_scouting")
+
+        cases = [
+            (39, [_ship(essex, 20)], 20, "pending"),
+            (40, [_ship(essex, 20)], 20, "earned"),
+            (100, [_ship(essex, 49), _ship(other, 95)], 144, "pending"),
+            (100, [_ship(essex, 50)], 50, "earned"),
+            (40, [_ship(other, 95)], 95, "pending"),
+            (40, [_ship(other, 95)], 100, "unknown"),
+            (40, None, 40, "unknown"),
+            (40, [_ship(essex, 41)], 41, "unknown"),
+        ]
+        for battles, solo_ships, solo_battles, expected in cases:
+            with self.subTest(battles=battles, solo_ships=solo_ships, solo_battles=solo_battles):
+                self.assertEqual(status(battles, solo_ships, solo_battles), expected)
+
     def test_coverage_achievements_require_the_denominator_but_known_count_can_earn(self):
         fleet = {"status":"ok","ships":[_ship("42",10),_ship("43",10),_ship("44",0)]}
         ids = frozenset({"42","43"})

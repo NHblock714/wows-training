@@ -74,7 +74,7 @@ def player_ratings(career, profile, *, species=None, tier=None, achievements=Non
         rankings = None
     gallery, collections = challenges.evaluate_challenges(raw, fleet, achievements,
         encyclopedia=refs.get('encyclopedia'), local_catalog=refs.get('local_catalog'),
-        solo=(solo_entry.get('account') or {}).get('statistics'),
+        solo=(solo_entry.get('account') or {}).get('statistics'), solo_fleet=solo_entry.get('ships'),
         created_at=snapshot.get('account_created_at'), region=snapshot.get('region'),
         as_of=snapshot.get('timestamp') if snapshot.get('time_kind') == 'fetched_at_utc' else None,
         numbers_rankings=rankings)
